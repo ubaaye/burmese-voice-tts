@@ -2,3 +2,4 @@ fastapi
 uvicorn
 edge-tts
 httpx
+python-multipart
