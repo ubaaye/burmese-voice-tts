@@ -66,15 +66,9 @@ async def synthesize_speech(req: TTSRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def run_clone(text: str, ref_text: str, speed: float,
-                    audio_bytes: bytes, filename: str, mime: str) -> bytes:
-    """Zero-shot Burmese voice cloning via the F5-Myanmar-TTS Space.
-
-    Returns the generated WAV bytes; raises HTTPException on failure.
-    """
-    if not HF_TOKEN:
-        raise HTTPException(status_code=500, detail="Clone is not configured (HF_TOKEN missing)")
-
+async def _clone_attempt(text: str, ref_text: str, speed: float,
+                         audio_bytes: bytes, filename: str, mime: str) -> bytes:
+    """One clone attempt against the Space; returns WAV bytes."""
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
 
     try:
@@ -162,6 +156,27 @@ async def run_clone(text: str, ref_text: str, speed: float,
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Clone service error: {e}")
+
+
+async def run_clone(text: str, ref_text: str, speed: float,
+                    audio_bytes: bytes, filename: str, mime: str) -> bytes:
+    """Zero-shot Burmese voice cloning via the F5-Myanmar-TTS Space.
+
+    The Space's GPU backend fails intermittently with an empty error,
+    so up to 4 attempts are made before giving up.
+    """
+    if not HF_TOKEN:
+        raise HTTPException(status_code=500, detail="Clone is not configured (HF_TOKEN missing)")
+    last_err = None
+    for attempt in range(1, 5):
+        try:
+            return await _clone_attempt(text, ref_text, speed, audio_bytes, filename, mime)
+        except HTTPException as e:
+            last_err = e
+            print(f"CLONE attempt {attempt} failed: {e.detail}", flush=True)
+            if attempt < 4:
+                await asyncio.sleep(15)
+    raise last_err
 
 
 def _validate_clone(text: str, ref_text: str):
