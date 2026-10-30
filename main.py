@@ -43,7 +43,7 @@ async def root():
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "service": "burmese-tts", "clone": bool(HF_TOKEN)}
+    return {"ok": True, "service": "burmese-tts", "clone": bool(HF_TOKEN), "v": 3}
 
 
 @app.post("/api/synthesize")
@@ -82,7 +82,9 @@ async def _clone_attempt(text: str, ref_text: str, speed: float,
             up.raise_for_status()
             up_path = up.json()[0]
 
-            # 2. Join the generation queue (full FileData, as gradio_client sends)
+            # 2. Call the named endpoint via the v2 route (full FileData,
+            #    as gradio_client sends). Unlike queue/join, this route
+            #    surfaces the Space's real error messages.
             file_data = {
                 "path": up_path,
                 "orig_name": filename,
@@ -91,53 +93,59 @@ async def _clone_attempt(text: str, ref_text: str, speed: float,
                 "is_stream": False,
                 "meta": {"_type": "gradio.FileData"},
             }
-            session = uuid.uuid4().hex[:12]
-            join = await client.post(
-                HF_SPACE + "/gradio_api/queue/join",
+            call = await client.post(
+                HF_SPACE + "/gradio_api/call/v2/generate_speech",
                 json={
-                    "data": [text, file_data, ref_text, speed],
-                    "session_hash": session,
-                    "fn_index": 0,
+                    "text": text,
+                    "ref_audio": file_data,
+                    "ref_text": ref_text,
+                    "speed": speed,
                 },
                 headers=headers,
             )
-            join.raise_for_status()
+            call.raise_for_status()
+            event_id = call.json().get("event_id")
+            if not event_id:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Clone service error: no event_id in call response: {call.text[:200]}",
+                )
 
-            # 3. Stream events until completion
+            # 3. Stream events until completion or error
             out_path = None
             fail_info = ""
+            current_event = ""
             async with client.stream(
                 "GET",
-                HF_SPACE + f"/gradio_api/queue/data?session_hash={session}",
+                HF_SPACE + f"/gradio_api/call/generate_speech/{event_id}",
                 headers=headers,
             ) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
+                    if line.startswith("event:"):
+                        current_event = line[6:].strip()
+                        continue
                     if not line.startswith("data:"):
                         continue
+                    raw = line[5:].strip()
                     try:
-                        evt = json.loads(line[5:].strip())
+                        payload = json.loads(raw)
                     except Exception:
                         continue
-                    print("CLONE EVT:", json.dumps(evt)[:600], flush=True)
-                    if evt.get("msg") == "process_completed":
-                        if evt.get("success"):
-                            data = evt.get("output", {}).get("data", [])
-                            if data:
-                                first = data[0]
-                                if isinstance(first, str):
-                                    out_path = first
-                                elif isinstance(first, dict):
-                                    out_path = first.get("path") or first.get("url")
-                        else:
-                            fail_info = str(
-                                evt.get("error") or evt.get("output") or evt
-                            )[:400]
-                        break
-                    if evt.get("msg") == "process_failed":
+                    print("CLONE EVT:", current_event, raw[:500], flush=True)
+                    if current_event == "error" or (
+                        isinstance(payload, dict) and payload.get("error")
+                    ):
                         fail_info = str(
-                            evt.get("error") or evt.get("output") or evt
+                            payload.get("error") if isinstance(payload, dict) else payload
                         )[:400]
+                        break
+                    if isinstance(payload, list) and payload:
+                        first = payload[0]
+                        if isinstance(first, str):
+                            out_path = first
+                        elif isinstance(first, dict):
+                            out_path = first.get("path") or first.get("url")
                         break
 
             if not out_path:
