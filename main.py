@@ -88,12 +88,20 @@ async def run_clone(text: str, ref_text: str, speed: float,
             up.raise_for_status()
             up_path = up.json()[0]
 
-            # 2. Join the generation queue
+            # 2. Join the generation queue (full FileData, as gradio_client sends)
+            file_data = {
+                "path": up_path,
+                "orig_name": filename,
+                "mime_type": mime,
+                "size": len(audio_bytes),
+                "is_stream": False,
+                "meta": {"_type": "gradio.FileData"},
+            }
             session = uuid.uuid4().hex[:12]
             join = await client.post(
                 HF_SPACE + "/gradio_api/queue/join",
                 json={
-                    "data": [text, {"path": up_path}, ref_text, speed],
+                    "data": [text, file_data, ref_text, speed],
                     "session_hash": session,
                     "fn_index": 0,
                 },
