@@ -1,6 +1,9 @@
 import asyncio
+import base64
 import json
 import os
+import re
+import struct
 import tempfile
 import uuid
 
@@ -35,6 +38,13 @@ EL_BASE = "https://api.elevenlabs.io"
 EL_DEFAULT_VOICE_ID = "RANtSKxEy3vvVXaqppeT"  # "NLO MyVoice v2" clone
 EL_DEFAULT_MODEL_ID = "eleven_v4"
 
+# Gemini TTS proxy: the API key lives ONLY in this server's environment.
+# It is never sent to the web app or included in any response/log.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_BASE = "https://generativelanguage.googleapis.com"
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+GEMINI_DEFAULT_VOICE = "Kore"
+
 
 class TTSRequest(BaseModel):
     text: str
@@ -50,7 +60,7 @@ async def root():
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "service": "burmese-tts", "clone": bool(HF_TOKEN), "el": bool(EL_API_KEY), "v": 3}
+    return {"ok": True, "service": "burmese-tts", "clone": bool(HF_TOKEN), "el": bool(EL_API_KEY), "gemini": bool(GEMINI_API_KEY), "v": 3}
 
 
 @app.post("/api/synthesize")
@@ -470,3 +480,130 @@ async def el_voices_delete(voice_id: str):
             detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
         )
     return {"deleted": True, "voice_id": voice_id}
+
+
+# --- Gemini TTS proxy (key stays server-side in GEMINI_API_KEY) ---
+
+class GeminiTTSRequest(BaseModel):
+    text: str
+    voice: str = GEMINI_DEFAULT_VOICE
+
+
+def _gemini_error_detail(resp: httpx.Response) -> str:
+    """Extract a short human-readable message from a Google API error body."""
+    try:
+        data = resp.json()
+    except Exception:
+        return resp.text[:200] or "unknown error"
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])[:300]
+    return str(data)[:300]
+
+
+def _pcm_to_wav(pcm: bytes, sample_rate: int, channels: int = 1,
+                bits_per_sample: int = 16) -> bytes:
+    """Wrap raw PCM audio in a standard 44-byte WAV header."""
+    byte_rate = sample_rate * channels * bits_per_sample // 8
+    block_align = channels * bits_per_sample // 8
+    header = b"".join([
+        b"RIFF", struct.pack("<I", 36 + len(pcm)), b"WAVE",
+        b"fmt ",
+        struct.pack(
+            "<IHHIIHH", 16, 1, channels, sample_rate,
+            byte_rate, block_align, bits_per_sample,
+        ),
+        b"data", struct.pack("<I", len(pcm)),
+    ])
+    return header + pcm
+
+
+@app.get("/api/gemini/status")
+async def gemini_status():
+    """Report whether Gemini TTS is configured, and which model is in use."""
+    if not GEMINI_API_KEY:
+        return {"configured": False}
+    return {"configured": True, "model": GEMINI_TTS_MODEL}
+
+
+@app.post("/api/gemini/tts")
+async def gemini_tts(req: GeminiTTSRequest):
+    """Generate speech via Gemini TTS using the server-side key.
+
+    Gemini returns base64-encoded raw PCM (L16); it is wrapped in a WAV
+    container before being returned as audio/wav.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini is not configured on the server (GEMINI_API_KEY missing)",
+        )
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Text is required")
+
+    payload = {
+        "contents": [{"parts": [{"text": req.text.strip()}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": req.voice},
+                },
+            },
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            resp = await client.post(
+                f"{GEMINI_BASE}/v1beta/models/{GEMINI_TTS_MODEL}:generateContent",
+                json=payload,
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY,
+                    "Content-Type": "application/json",
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini service error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Gemini error ({resp.status_code}): {_gemini_error_detail(resp)}",
+        )
+
+    try:
+        data = resp.json()
+        parts = data["candidates"][0]["content"]["parts"]
+        if not isinstance(parts, list):
+            parts = []
+    except Exception:
+        parts = []
+
+    inline = None
+    for part in parts:
+        if isinstance(part, dict):
+            candidate = part.get("inlineData")
+            if isinstance(candidate, dict) and candidate.get("data"):
+                inline = candidate
+                break
+
+    if inline is None:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini returned no audio: {resp.text[:200]}",
+        )
+
+    mime = inline.get("mimeType") or ""
+    rate_match = re.search(r"rate=(\d+)", mime)
+    sample_rate = int(rate_match.group(1)) if rate_match else 24000
+
+    try:
+        pcm = base64.b64decode(inline["data"])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini audio decode failed: {e}")
+
+    return Response(content=_pcm_to_wav(pcm, sample_rate), media_type="audio/wav")
