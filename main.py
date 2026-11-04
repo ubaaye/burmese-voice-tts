@@ -363,3 +363,83 @@ async def el_tts(req: ELTTSRequest):
             detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
         )
     return Response(content=resp.content, media_type="audio/mpeg")
+
+
+@app.get("/api/el/voices")
+async def el_voices_list():
+    """List the ElevenLabs voices available to the server-side key."""
+    if not EL_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="ElevenLabs is not configured on the server (EL_API_KEY missing)",
+        )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            resp = await client.get(
+                EL_BASE + "/v1/voices",
+                headers={"xi-api-key": EL_API_KEY},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs service error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
+        )
+    data = resp.json()
+    voices = [
+        {
+            "voice_id": v.get("voice_id"),
+            "name": v.get("name"),
+            "category": v.get("category"),
+        }
+        for v in data.get("voices", [])
+        if isinstance(v, dict)
+    ]
+    return {"voices": voices}
+
+
+@app.post("/api/el/voices")
+async def el_voices_add(name: str = Form(...), sample: UploadFile = File(...)):
+    """Create a new ElevenLabs cloned voice from an uploaded audio sample."""
+    if not EL_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="ElevenLabs is not configured on the server (EL_API_KEY missing)",
+        )
+    if not name or not name.strip():
+        raise HTTPException(status_code=400, detail="Voice name is required")
+
+    sample_bytes = await sample.read()
+    if not sample_bytes:
+        raise HTTPException(status_code=400, detail="Sample audio file is empty")
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            resp = await client.post(
+                EL_BASE + "/v1/voices/add",
+                data={"name": name.strip()},
+                files={
+                    "files": (
+                        sample.filename or "sample.mp3",
+                        sample_bytes,
+                        sample.content_type or "audio/mpeg",
+                    )
+                },
+                headers={"xi-api-key": EL_API_KEY},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs service error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
+        )
+    data = resp.json()
+    return {"voice_id": data.get("voice_id"), "name": name.strip()}
