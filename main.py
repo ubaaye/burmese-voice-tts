@@ -443,3 +443,30 @@ async def el_voices_add(name: str = Form(...), sample: UploadFile = File(...)):
         )
     data = resp.json()
     return {"voice_id": data.get("voice_id"), "name": name.strip()}
+
+
+@app.delete("/api/el/voices/{voice_id}")
+async def el_voices_delete(voice_id: str):
+    """Delete an ElevenLabs voice using the server-side key."""
+    if not EL_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="ElevenLabs is not configured on the server (EL_API_KEY missing)",
+        )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            resp = await client.delete(
+                f"{EL_BASE}/v1/voices/{voice_id}",
+                headers={"xi-api-key": EL_API_KEY},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs service error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
+        )
+    return {"deleted": True, "voice_id": voice_id}
