@@ -28,6 +28,13 @@ if os.path.exists("public"):
 HF_SPACE = "https://freococo-f5-myanmar-tts-demo.hf.space"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
+# ElevenLabs proxy: the API key lives ONLY in this server's environment.
+# It is never sent to the web app or included in any response/log.
+EL_API_KEY = os.environ.get("EL_API_KEY", "")
+EL_BASE = "https://api.elevenlabs.io"
+EL_DEFAULT_VOICE_ID = "RANtSKxEy3vvVXaqppeT"  # "NLO MyVoice v2" clone
+EL_DEFAULT_MODEL_ID = "eleven_v4"
+
 
 class TTSRequest(BaseModel):
     text: str
@@ -43,7 +50,7 @@ async def root():
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "service": "burmese-tts", "clone": bool(HF_TOKEN), "v": 3}
+    return {"ok": True, "service": "burmese-tts", "clone": bool(HF_TOKEN), "el": bool(EL_API_KEY), "v": 3}
 
 
 @app.post("/api/synthesize")
@@ -271,3 +278,88 @@ async def clone_job_audio(job_id: str):
     if job["status"] != "done":
         raise HTTPException(status_code=409, detail=f"Job not ready: {job['status']}")
     return Response(content=job["audio"], media_type="audio/wav")
+
+
+# --- ElevenLabs proxy (key stays server-side in EL_API_KEY) ---
+
+class ELTTSRequest(BaseModel):
+    text: str
+    voice_id: str = EL_DEFAULT_VOICE_ID
+    model_id: str = EL_DEFAULT_MODEL_ID
+    speed: float | None = None
+
+
+def _el_error_detail(resp: httpx.Response) -> str:
+    """Extract a short human-readable message from an ElevenLabs error body."""
+    try:
+        data = resp.json()
+    except Exception:
+        return resp.text[:200] or "unknown error"
+    detail = data.get("detail", data) if isinstance(data, dict) else data
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail.get("status") or detail)[:300]
+    return str(detail)[:300]
+
+
+@app.get("/api/el/status")
+async def el_status():
+    """Report whether ElevenLabs is configured, plus usage when available."""
+    if not EL_API_KEY:
+        return {"configured": False}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            resp = await client.get(
+                EL_BASE + "/v1/user/subscription",
+                headers={"xi-api-key": EL_API_KEY},
+            )
+        if resp.status_code != 200:
+            # Key exists but usage could not be read; still configured.
+            return {"configured": True}
+        data = resp.json()
+        return {
+            "configured": True,
+            "used": data.get("character_count"),
+            "limit": data.get("character_limit"),
+            "resets": data.get("next_character_count_reset_unix"),
+        }
+    except Exception:
+        return {"configured": True}
+
+
+@app.post("/api/el/tts")
+async def el_tts(req: ELTTSRequest):
+    """Generate speech via ElevenLabs using the server-side key."""
+    if not EL_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="ElevenLabs is not configured on the server (EL_API_KEY missing)",
+        )
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Text is required")
+
+    body: dict = {"text": req.text.strip(), "model_id": req.model_id}
+    if req.speed is not None:
+        body["voice_settings"] = {"speed": req.speed}
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            resp = await client.post(
+                f"{EL_BASE}/v1/text-to-speech/{req.voice_id}",
+                json=body,
+                headers={
+                    "xi-api-key": EL_API_KEY,
+                    "Content-Type": "application/json",
+                    "Accept": "audio/mpeg",
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs service error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
+        )
+    return Response(content=resp.content, media_type="audio/mpeg")
