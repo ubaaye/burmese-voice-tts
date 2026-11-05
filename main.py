@@ -86,6 +86,15 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 # /api/admin/* endpoints. When unset those routes are locked (503).
 OWNER_KEY = os.environ.get("OWNER_KEY", "")
 
+# The owner's Supabase account email. As an alternative to carrying the
+# owner key, the /api/admin/* endpoints also accept the owner's
+# Supabase login: an "Authorization: Bearer <jwt>" that verifies
+# against the project JWKS and whose verified email claim equals this
+# address (compared case-insensitively). Unset disables that path, as
+# does an unset SUPABASE_URL. The private paid routes are unaffected:
+# they keep the owner key only.
+OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "").strip()
+
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB cap on audio uploads
 MAX_TEXT_CHARS = 5000  # blunt backstop on EL/Gemini text (app limits are lower)
 PUB_SYNTH_MAX_CHARS = 600  # per-request cap on the free public Edge route
@@ -1226,13 +1235,15 @@ async def pub_clone_job_audio(job_id: str, request: Request):
 
 
 # --- Owner lock + Pro codes (phase 4) ---
-# The private paid routes (/api/el/*, /api/gemini/*, /api/clone*) and
-# the /api/admin/* endpoints require the X-Owner-Key header to match
-# OWNER_KEY. When OWNER_KEY is unset they return 503 (locked) rather
-# than open. Pro routes additionally require a valid Pro code (below).
+# The private paid routes (/api/el/*, /api/gemini/*, /api/clone*)
+# require the X-Owner-Key header to match OWNER_KEY. The
+# /api/admin/* endpoints accept that key too, or alternatively the
+# owner's Supabase login (see _require_admin). When no admin path is
+# configured those routes return 503 (locked) rather than open. Pro
+# routes additionally require a valid Pro code (below).
 
 def _require_owner(request: Request):
-    """Gate for the owner's private paid routes and the admin API."""
+    """Gate for the owner's private paid routes (key only)."""
     if not OWNER_KEY:
         raise HTTPException(
             status_code=503,
@@ -1246,6 +1257,58 @@ def _require_owner(request: Request):
             detail="Owner key required or invalid. "
                    "(ပိုင်ရှင် key လိုအပ်ပါတယ်)",
         )
+
+
+_OWNER_401_MSG = (
+    "Owner key required or invalid. "
+    "(ပိုင်ရှင် key လိုအပ်ပါတယ်)"
+)
+
+_OWNER_503_MSG = (
+    "Owner access is locked on this server "
+    "(OWNER_KEY not configured)."
+)
+
+
+async def _require_admin(request: Request):
+    """Gate for the /api/admin/* endpoints: owner key OR owner login.
+
+    Passes when EITHER
+    (a) the X-Owner-Key header matches OWNER_KEY (the original
+        behaviour, unchanged), or
+    (b) an "Authorization: Bearer <jwt>" is present, the token verifies
+        against the Supabase project JWKS (same helper as the public
+        routes), and its verified email claim equals OWNER_EMAIL,
+        compared case-insensitively.
+    Path (b) is disabled when OWNER_EMAIL or SUPABASE_URL is unset (or
+    the JWT library is unavailable). The owner key is checked first so
+    a valid key never depends on the JWKS fetch. When neither path is
+    configured the endpoints stay locked (503); any other failure is
+    the same generic 401 as the owner-key gate — no auth material (key
+    or token) is echoed in errors or logs.
+    """
+    if OWNER_KEY:
+        supplied = (request.headers.get("X-Owner-Key") or "").strip()
+        if supplied and hmac.compare_digest(supplied, OWNER_KEY):
+            return
+    jwt_path = bool(OWNER_EMAIL and SUPABASE_URL and _pyjwt is not None)
+    if jwt_path:
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if token:
+            try:
+                payload = await _verify_supabase_token(token)
+            except HTTPException:
+                payload = None
+            email = (payload or {}).get("email")
+            if (
+                isinstance(email, str)
+                and email.strip().lower() == OWNER_EMAIL.lower()
+            ):
+                return
+    if not OWNER_KEY and not jwt_path:
+        raise HTTPException(status_code=503, detail=_OWNER_503_MSG)
+    raise HTTPException(status_code=401, detail=_OWNER_401_MSG)
 
 
 _PRO_403_MSG = (
@@ -1411,7 +1474,7 @@ def _public_code_row(row: dict) -> dict:
 @app.post("/api/admin/codes")
 async def admin_codes_create(req: AdminCodeCreate, request: Request):
     """Issue a new Pro code (owner only)."""
-    _require_owner(request)
+    await _require_admin(request)
     _require_pro_store()
     code = str(uuid.uuid4())
     row = await _sb_codes_insert(code, (req.label or "").strip())
@@ -1425,7 +1488,7 @@ async def admin_codes_create(req: AdminCodeCreate, request: Request):
 @app.get("/api/admin/codes")
 async def admin_codes_list(request: Request):
     """List all Pro codes with their binding/status (owner only)."""
-    _require_owner(request)
+    await _require_admin(request)
     _require_pro_store()
     rows = await _sb_codes_list()
     return {"codes": [_public_code_row(r) for r in rows if isinstance(r, dict)]}
@@ -1434,7 +1497,7 @@ async def admin_codes_list(request: Request):
 @app.post("/api/admin/codes/{code}/revoke")
 async def admin_codes_revoke(code: str, request: Request):
     """Revoke a Pro code (owner only)."""
-    _require_owner(request)
+    await _require_admin(request)
     _require_pro_store()
     rows = await _sb_codes_patch(code, {"active": False})
     if not rows:
@@ -1445,7 +1508,7 @@ async def admin_codes_revoke(code: str, request: Request):
 @app.post("/api/admin/codes/{code}/unbind")
 async def admin_codes_unbind(code: str, request: Request):
     """Clear a Pro code's bound user so it can be reassigned (owner only)."""
-    _require_owner(request)
+    await _require_admin(request)
     _require_pro_store()
     rows = await _sb_codes_patch(code, {"bound_user_id": None})
     if not rows:
