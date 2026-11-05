@@ -1144,6 +1144,7 @@ def _pub_synth_rate_check(user_id: str, ip: str):
 async def pub_synthesize(req: TTSRequest, request: Request):
     """Free public Edge TTS: login required, rate-limited, short texts."""
     user_id = await _require_pub_user(request)
+    await _check_mode_enabled(user_id, "edge")
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
     if len(req.text) > PUB_SYNTH_MAX_CHARS:
@@ -1167,6 +1168,7 @@ async def pub_synthesize(req: TTSRequest, request: Request):
 async def pub_el_tts(req: ELTTSRequest, request: Request):
     """Public ElevenLabs TTS with the VISITOR's own key (X-EL-Key)."""
     user_id, user_email = await _require_pub_identity(request)
+    await _check_mode_enabled(user_id, "el")
     api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
     code, needs_bind = await _require_pro_code(request, user_id, user_email)
     resp = await _el_tts_core(req, api_key)
@@ -1178,6 +1180,7 @@ async def pub_el_tts(req: ELTTSRequest, request: Request):
 async def pub_el_voices(request: Request):
     """List the voices on the VISITOR's own ElevenLabs account."""
     user_id, user_email = await _require_pub_identity(request)
+    await _check_mode_enabled(user_id, "el")
     api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
     code, needs_bind = await _require_pro_code(request, user_id, user_email)
     resp = await _el_voices_core(api_key)
@@ -1191,6 +1194,7 @@ async def pub_el_voice_add(request: Request, name: str = Form(...), sample: Uplo
     (X-EL-Key): the same upstream call as the private route, with the
     visitor's key. The server's EL_API_KEY is never used here."""
     user_id, user_email = await _require_pub_identity(request)
+    await _check_mode_enabled(user_id, "el")
     api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
     code, needs_bind = await _require_pro_code(request, user_id, user_email)
     if not name or not name.strip():
@@ -1214,6 +1218,7 @@ async def pub_el_voice_delete(voice_id: str, request: Request):
     (X-EL-Key). Only voices that key owns can be deleted — ElevenLabs
     itself rejects anything else, and the error surfaces upstream's."""
     user_id, user_email = await _require_pub_identity(request)
+    await _check_mode_enabled(user_id, "el")
     api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
     code, needs_bind = await _require_pro_code(request, user_id, user_email)
     await _el_voice_delete_core(voice_id, api_key)
@@ -1225,6 +1230,7 @@ async def pub_el_voice_delete(voice_id: str, request: Request):
 async def pub_gemini_tts(req: GeminiTTSRequest, request: Request):
     """Public Gemini TTS (3.8 contract) with the VISITOR's own key."""
     user_id, user_email = await _require_pub_identity(request)
+    await _check_mode_enabled(user_id, "gemini")
     api_key = _require_byok_key(request, "X-Gemini-Key", "Gemini")
     code, needs_bind = await _require_pro_code(request, user_id, user_email)
     resp = await _gemini_tts_core(req, api_key)
@@ -1246,6 +1252,7 @@ async def pub_clone_job_create(
     only; it is not written into the job entry or anywhere else.
     """
     user_id, user_email = await _require_pub_identity(request)
+    await _check_mode_enabled(user_id, "f5")
     token = _require_byok_key(request, "X-HF-Token", "Hugging Face")
     code, needs_bind = await _require_pro_code(request, user_id, user_email)
     if not text.strip():
@@ -1528,6 +1535,106 @@ async def _pro_code_touch(code: str, user_id: str, bind: bool):
         print("WARN: pro code stamp failed", flush=True)
 
 
+# --- Per-user usage view + TTS kill-switch (phase 9) ---
+# The admin app lists every registered user with their TTS usage
+# (aggregated from usage_log) and can disable individual engines per
+# user (user_controls.disabled_modes). The public routes consult the
+# same table as a SOFT control: any store problem means "enabled".
+
+TTS_MODES = ("edge", "el", "gemini", "f5")
+
+_MODE_DISABLED_MSG = (
+    "This TTS engine is disabled by the admin. "
+    "(ဒီ TTS ကို admin က ပိတ်ထားပါတယ်)"
+)
+
+_USER_SVC_502_MSG = "User service unavailable"
+
+
+async def _sb_get_json(path: str, params: dict):
+    """GET a Supabase URL (REST or Auth Admin) with the service key;
+    returns the parsed JSON body. Any failure is a generic 502 — no
+    upstream detail (and never any key material) is echoed."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), trust_env=False) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}{path}", params=params, headers=_sb_headers(),
+            )
+    except Exception:
+        raise HTTPException(status_code=502, detail=_USER_SVC_502_MSG)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=_USER_SVC_502_MSG)
+    try:
+        return resp.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail=_USER_SVC_502_MSG)
+
+
+async def _sb_auth_users() -> list:
+    """All registered users from the Supabase Auth Admin API."""
+    data = await _sb_get_json("/auth/v1/admin/users", {"per_page": 1000})
+    users = data.get("users") if isinstance(data, dict) else None
+    if not isinstance(users, list):
+        raise HTTPException(status_code=502, detail=_USER_SVC_502_MSG)
+    return [u for u in users if isinstance(u, dict)]
+
+
+async def _sb_usage_rows() -> list:
+    rows = await _sb_get_json(
+        "/rest/v1/usage_log",
+        {"select": "user_id,mode,chars,duration_seconds,created_at",
+         "limit": 20000},
+    )
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail=_USER_SVC_502_MSG)
+    return [r for r in rows if isinstance(r, dict)]
+
+
+async def _sb_controls_rows() -> list:
+    rows = await _sb_get_json(
+        "/rest/v1/user_controls", {"select": "user_id,disabled_modes"},
+    )
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail=_USER_SVC_502_MSG)
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _valid_modes(value) -> list:
+    """The canonical subset of a stored/requested disabled_modes list."""
+    if not isinstance(value, list):
+        return []
+    return [m for m in value if m in TTS_MODES]
+
+
+async def _check_mode_enabled(user_id: str, mode: str):
+    """Raise 403 when the admin disabled `mode` for this user.
+
+    FAILS OPEN by design: an unconfigured store, a fetch error, a
+    non-200 response, or a missing/malformed row all mean "enabled" —
+    this soft control must never take the public routes down.
+    """
+    if not _pro_store_configured():
+        return
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/user_controls",
+                params={"user_id": f"eq.{user_id}", "select": "disabled_modes"},
+                headers=_sb_headers(),
+            )
+    except Exception:
+        return
+    if resp.status_code != 200:
+        return
+    try:
+        rows = resp.json()
+    except Exception:
+        return
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        if mode in _valid_modes(rows[0].get("disabled_modes")):
+            raise HTTPException(status_code=403, detail=_MODE_DISABLED_MSG)
+
+
 class AdminCodeCreate(BaseModel):
     label: str = ""
     email: str = ""
@@ -1608,3 +1715,147 @@ async def admin_codes_unbind(code: str, request: Request):
     if not rows:
         raise HTTPException(status_code=404, detail="Code not found")
     return {"code": code, "bound_user_id": None}
+
+
+def _blank_usage() -> dict:
+    return {
+        "totals": {"calls": 0, "chars": 0, "seconds": 0.0},
+        "by_mode": {m: {"calls": 0, "chars": 0, "seconds": 0.0}
+                    for m in TTS_MODES},
+        "last_used_at": None,
+    }
+
+
+@app.get("/api/admin/users")
+async def admin_users_list(request: Request):
+    """Every registered user with per-engine TTS usage totals and
+    their disabled engines (owner only). Aggregation happens here:
+    usage_log rows are summed per user per mode in Python."""
+    await _require_admin(request)
+    _require_pro_store()
+    auth_users = await _sb_auth_users()
+    usage_rows = await _sb_usage_rows()
+    controls_rows = await _sb_controls_rows()
+
+    disabled_by_user = {}
+    for row in controls_rows:
+        uid = row.get("user_id")
+        if uid:
+            disabled_by_user[str(uid)] = _valid_modes(row.get("disabled_modes"))
+
+    usage_by_user: dict = {}
+    for row in usage_rows:
+        uid = row.get("user_id")
+        if not uid:
+            continue
+        uid = str(uid)
+        entry = usage_by_user.setdefault(uid, _blank_usage())
+        mode = row.get("mode")
+        bucket = entry["by_mode"].get(mode) if isinstance(mode, str) else None
+        try:
+            chars = int(row.get("chars") or 0)
+        except Exception:
+            chars = 0
+        try:
+            seconds = float(row.get("duration_seconds") or 0)
+        except Exception:
+            seconds = 0.0
+        entry["totals"]["calls"] += 1
+        entry["totals"]["chars"] += chars
+        entry["totals"]["seconds"] += seconds
+        if bucket is not None:
+            bucket["calls"] += 1
+            bucket["chars"] += chars
+            bucket["seconds"] += seconds
+        created = row.get("created_at")
+        if isinstance(created, str) and (
+            entry["last_used_at"] is None or created > entry["last_used_at"]
+        ):
+            entry["last_used_at"] = created
+
+    users = []
+    seen = set()
+    for u in auth_users:
+        uid = u.get("id")
+        if not uid:
+            continue
+        uid = str(uid)
+        seen.add(uid)
+        entry = usage_by_user.get(uid) or _blank_usage()
+        users.append({
+            "user_id": uid,
+            "email": u.get("email"),
+            "created_at": u.get("created_at"),
+            "last_sign_in_at": u.get("last_sign_in_at"),
+            "last_used_at": entry["last_used_at"],
+            "totals": entry["totals"],
+            "by_mode": entry["by_mode"],
+            "disabled_modes": disabled_by_user.get(uid, []),
+        })
+    # Usage recorded for an id that is no longer (or not yet) in the
+    # auth list still shows up, with no email on file.
+    for uid in sorted(set(usage_by_user) - seen):
+        entry = usage_by_user[uid]
+        users.append({
+            "user_id": uid,
+            "email": None,
+            "created_at": None,
+            "last_sign_in_at": None,
+            "last_used_at": entry["last_used_at"],
+            "totals": entry["totals"],
+            "by_mode": entry["by_mode"],
+            "disabled_modes": disabled_by_user.get(uid, []),
+        })
+    return {"users": users}
+
+
+@app.post("/api/admin/users/{user_id}/controls")
+async def admin_users_set_controls(user_id: str, request: Request):
+    """Set one user's disabled TTS engines (owner only).
+
+    Body: {"disabled_modes": [...]} — every item must be one of the
+    canonical mode strings, else 400. Upserts the user_controls row.
+    """
+    await _require_admin(request)
+    _require_pro_store()
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    modes = body.get("disabled_modes") if isinstance(body, dict) else None
+    if not isinstance(modes, list) or any(m not in TTS_MODES for m in modes):
+        raise HTTPException(
+            status_code=400,
+            detail="disabled_modes must be a list containing only: "
+                   + ", ".join(TTS_MODES),
+        )
+    modes = list(dict.fromkeys(modes))
+
+    email = None
+    try:
+        for u in await _sb_auth_users():
+            if str(u.get("id")) == user_id:
+                email = u.get("email")
+                break
+    except Exception:
+        email = None  # the email stamp is best-effort; the upsert matters
+
+    row = {
+        "user_id": user_id,
+        "email": email,
+        "disabled_modes": modes,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), trust_env=False) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/user_controls",
+                json=row,
+                headers={**_sb_headers(),
+                         "Prefer": "resolution=merge-duplicates,return=representation"},
+            )
+    except Exception:
+        raise HTTPException(status_code=502, detail=_USER_SVC_502_MSG)
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=_USER_SVC_502_MSG)
+    return {"ok": True, "user_id": user_id, "disabled_modes": modes}
