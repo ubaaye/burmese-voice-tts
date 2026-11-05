@@ -7,6 +7,8 @@ import struct
 import tempfile
 import uuid
 
+from typing import Any
+
 import edge_tts
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -42,7 +44,7 @@ EL_DEFAULT_MODEL_ID = "eleven_v4"
 # It is never sent to the web app or included in any response/log.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
-GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 GEMINI_DEFAULT_VOICE = "Kore"
 
 
@@ -487,6 +489,11 @@ async def el_voices_delete(voice_id: str):
 class GeminiTTSRequest(BaseModel):
     text: str
     voice: str = GEMINI_DEFAULT_VOICE
+    # Optional two-speaker dialogue: a list of exactly 2 objects
+    # {"speaker": "<name>", "voice": "<voiceName>"}. Typed as Any and
+    # validated manually in the handler so ANY malformed speakers payload
+    # returns a clear HTTP 400 instead of a pydantic 422.
+    speakers: Any = None
 
 
 def _gemini_error_detail(resp: httpx.Response) -> str:
@@ -500,6 +507,45 @@ def _gemini_error_detail(resp: httpx.Response) -> str:
         if isinstance(err, dict) and err.get("message"):
             return str(err["message"])[:300]
     return str(data)[:300]
+
+
+def _gemini_speaker_configs(speakers) -> list:
+    """Validate the optional two-speaker payload and build Gemini's
+    speakerVoiceConfigs list. Raises HTTP 400 on any malformed input."""
+    if not isinstance(speakers, list) or len(speakers) != 2:
+        raise HTTPException(
+            status_code=400,
+            detail="speakers must be a list of exactly 2 entries: "
+                   '[{"speaker": name, "voice": voiceName}, ...]',
+        )
+    configs = []
+    for entry in speakers:
+        if not isinstance(entry, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Each speakers entry must be an object with "
+                       "'speaker' and 'voice'",
+            )
+        name = entry.get("speaker")
+        voice = entry.get("voice")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Each speakers entry needs a non-empty 'speaker' name",
+            )
+        if not isinstance(voice, str) or not voice.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Each speakers entry needs a non-empty 'voice' "
+                       "(Gemini voice name)",
+            )
+        configs.append({
+            "speaker": name.strip(),
+            "voiceConfig": {
+                "prebuiltVoiceConfig": {"voiceName": voice.strip()},
+            },
+        })
+    return configs
 
 
 def _pcm_to_wav(pcm: bytes, sample_rate: int, channels: int = 1,
@@ -542,15 +588,24 @@ async def gemini_tts(req: GeminiTTSRequest):
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
 
+    if req.speakers is not None:
+        speech_config = {
+            "multiSpeakerVoiceConfig": {
+                "speakerVoiceConfigs": _gemini_speaker_configs(req.speakers),
+            },
+        }
+    else:
+        speech_config = {
+            "voiceConfig": {
+                "prebuiltVoiceConfig": {"voiceName": req.voice},
+            },
+        }
+
     payload = {
         "contents": [{"parts": [{"text": req.text.strip()}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
-            "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": req.voice},
-                },
-            },
+            "speechConfig": speech_config,
         },
     }
 
