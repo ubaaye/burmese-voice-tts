@@ -3,3 +3,4 @@ uvicorn
 edge-tts
 httpx
 python-multipart
+pyjwt[crypto]
