@@ -494,6 +494,11 @@ class GeminiTTSRequest(BaseModel):
     # validated manually in the handler so ANY malformed speakers payload
     # returns a clear HTTP 400 instead of a pydantic 422.
     speakers: Any = None
+    # Optional tone/style instruction (e.g. "Say cheerfully and slowly").
+    # When non-empty it is prepended to the text sent upstream as
+    # "<style>: <text>", the model's documented style-prompt pattern.
+    # Also typed as Any and validated manually (400, not 422).
+    style: Any = None
 
 
 def _gemini_error_detail(resp: httpx.Response) -> str:
@@ -548,6 +553,55 @@ def _gemini_speaker_configs(speakers) -> list:
     return configs
 
 
+def _gemini_dialogue_parts(text: str, speaker_names: list) -> list:
+    """Split dialogue text into one upstream content part per segment.
+
+    A line starting with "<speakerName>:" (for one of the two declared
+    speaker names) opens a new segment for that speaker; any other line
+    continues the current speaker's segment, and leading unprefixed text
+    belongs to the first speaker. The 3.8 TTS model rejects
+    multi-speaker requests unless EVERY text part carries
+    speech_metadata naming its speaker ("Multi-speaker generation
+    requests must specify speech_metadata.speaker for each text part in
+    the contents"), so each returned part is
+    {"text": <segment text, "Name:" prefix stripped>,
+     "speech_metadata": {"speaker": <speakerName>}}.
+    Empty segments are dropped.
+    """
+    prefix_res = [
+        (name, re.compile(r"^\s*" + re.escape(name) + r"\s*:\s?(.*)$"))
+        for name in speaker_names
+    ]
+    segments = []  # list of [speaker, [line, ...]]
+    current = None
+    for raw_line in text.splitlines():
+        matched_name = None
+        matched_rest = ""
+        for name, pattern in prefix_res:
+            m = pattern.match(raw_line)
+            if m:
+                matched_name = name
+                matched_rest = m.group(1)
+                break
+        if matched_name is not None:
+            current = [matched_name, [matched_rest]]
+            segments.append(current)
+        else:
+            if current is None:
+                current = [speaker_names[0], []]
+                segments.append(current)
+            current[1].append(raw_line)
+    parts = []
+    for speaker, lines in segments:
+        seg_text = "\n".join(lines).strip()
+        if seg_text:
+            parts.append({
+                "text": seg_text,
+                "speech_metadata": {"speaker": speaker},
+            })
+    return parts
+
+
 def _pcm_to_wav(pcm: bytes, sample_rate: int, channels: int = 1,
                 bits_per_sample: int = 16) -> bytes:
     """Wrap raw PCM audio in a standard 44-byte WAV header."""
@@ -588,21 +642,56 @@ async def gemini_tts(req: GeminiTTSRequest):
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
 
+    style = ""
+    if req.style is not None:
+        if not isinstance(req.style, str):
+            raise HTTPException(
+                status_code=400,
+                detail="style must be a string (a tone/style instruction)",
+            )
+        style = req.style.strip()
+
+    text = req.text.strip()
+
     if req.speakers is not None:
+        speaker_configs = _gemini_speaker_configs(req.speakers)
         speech_config = {
             "multiSpeakerVoiceConfig": {
-                "speakerVoiceConfigs": _gemini_speaker_configs(req.speakers),
+                "speakerVoiceConfigs": speaker_configs,
             },
         }
+        # The 3.8 model requires the dialogue split into per-speaker
+        # parts, each tagged with speech_metadata (see
+        # _gemini_dialogue_parts); one shared text part is rejected.
+        parts = _gemini_dialogue_parts(
+            text, [c["speaker"] for c in speaker_configs],
+        )
+        speakers_present = {p["speech_metadata"]["speaker"] for p in parts}
+        if len(speakers_present) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Dialogue text must give each speaker at least one "
+                       "line, prefixed with '<speaker>:' "
+                       "(e.g. 'A: ...' and 'B: ...')",
+            )
+        if style:
+            # Prefix the direction onto the FIRST segment's text so the
+            # direction itself is spoken by a speaker: a separate
+            # leading part without speech_metadata would break the
+            # multi-speaker rule that every part names its speaker.
+            parts[0]["text"] = f"{style}: {parts[0]['text']}"
     else:
         speech_config = {
             "voiceConfig": {
                 "prebuiltVoiceConfig": {"voiceName": req.voice},
             },
         }
+        if style:
+            text = f"{style}: {text}"
+        parts = [{"text": text}]
 
     payload = {
-        "contents": [{"parts": [{"text": req.text.strip()}]}],
+        "contents": [{"parts": parts}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": speech_config,
