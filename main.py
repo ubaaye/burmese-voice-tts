@@ -2,13 +2,16 @@ import asyncio
 import base64
 import hmac
 import json
+import math
 import os
 import re
 import struct
+import sys
 import tempfile
 import time
 import uuid
 
+from array import array
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any
@@ -64,13 +67,16 @@ GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 GEMINI_DEFAULT_VOICE = "Kore"
 
 # --- Public edition (Supabase login + bring-your-own-key) ---
-# A public deployment sets SUPABASE_URL and deliberately leaves HF_TOKEN /
-# EL_API_KEY / GEMINI_API_KEY UNSET, so the owner's keys can never serve
-# strangers. Every /api/pub/* route requires a valid Supabase access token
-# (Authorization: Bearer <jwt>, verified against the project JWKS below),
-# and the paid/quota routes additionally require the VISITOR's own provider
-# key per request (X-EL-Key / X-Gemini-Key / X-HF-Token headers). Visitor
-# keys are used for that request/job only and are never stored or logged.
+# Every /api/pub/* route requires a valid Supabase access token
+# (Authorization: Bearer <jwt>, verified against the project JWKS below).
+# The paid/quota routes resolve their provider key per request (phase
+# 11, see _resolve_pub_key): a valid Pro code — or the owner's own
+# login — runs on the SERVER's env key for the engine, while a visitor
+# key header (X-EL-Key / X-Gemini-Key / X-HF-Token) runs on the
+# visitor's own key with no code involved. A deployment that leaves the
+# env keys UNSET simply cannot serve the code/owner paths (they 503);
+# bring-your-own-key calls keep working. Visitor keys are used for that
+# request/job only and are never stored or logged.
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_JWKS_URL = (
     f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else ""
@@ -100,6 +106,11 @@ MAX_TEXT_CHARS = 5000  # blunt backstop on EL/Gemini text (app limits are lower)
 PUB_SYNTH_MAX_CHARS = 600  # per-request cap on the free public Edge route
 PUB_SYNTH_LIMIT = 120  # requests per window, per user and (secondary) per IP
 PUB_SYNTH_WINDOW = 3600  # 1 hour
+# Phase 11: a public Pro call may run on the SERVER's key (valid Pro code,
+# or the owner). ElevenLabs chars on that path are capped per user per
+# UTC day so one code cannot drain the owner's balance; callers using
+# their OWN key are never capped.
+SERVER_EL_DAILY_CHAR_CAP = 10000
 JOB_TTL_SECONDS = 1800  # finished clone jobs (and their audio) expire after 30 min
 
 
@@ -716,8 +727,11 @@ class GeminiTTSRequest(BaseModel):
     # returns a clear HTTP 400 instead of a pydantic 422.
     speakers: Any = None
     # Optional tone/style instruction (e.g. "Say cheerfully and slowly").
-    # When non-empty it is prepended to the text sent upstream as
-    # "<style>: <text>", the model's documented style-prompt pattern.
+    # When non-empty it is converted by _gemini_style_prefix into an
+    # English director's-note prefix for the upstream text: the model
+    # READS ALOUD a non-English style (e.g. a Burmese tone word) as if
+    # it were content, while an English instruction sentence is treated
+    # as a direction and not spoken.
     # Also typed as Any and validated manually (400, not 422).
     style: Any = None
 
@@ -823,6 +837,61 @@ def _gemini_dialogue_parts(text: str, speaker_names: list) -> list:
     return parts
 
 
+# Burmese tone words the app offers as one-tap style chips, mapped to
+# English tone phrases. Live-verified behaviour: a style written in
+# Burmese is READ ALOUD by the model as content (the listener hears the
+# style word itself), while an English instruction sentence is treated
+# as a director's note and not spoken — so Burmese styles must be
+# translated before they reach the upstream prompt.
+_GEMINI_STYLE_MAP = [
+    ("ဒေါသ", "an angry"),
+    ("ပျော်", "a cheerful and friendly"),
+    ("ရွှင်လန်း", "a cheerful and friendly"),
+    ("တည်ငြိမ်", "a calm and relaxed"),
+    ("နွေးထွေး", "a warm and enthusiastic"),
+    ("ဝမ်းနည်း", "a sad and heartfelt"),
+    ("တိုးတိုး", "a whispered"),
+    ("စိတ်လှုပ်ရှား", "an excited, high-energy"),
+    ("ပုံပြင်", "a warm storytelling"),
+    ("သတင်း", "a clear newsreader"),
+    ("နှေး", "a slow"),
+    ("မြန်", "a rapid"),
+    ("မောပန်း", "an out-of-breath"),
+    ("ပျင်းရိ", "a bored, monotone"),
+    ("ကြင်နာ", "a gentle and kind"),
+    ("ကြောက်", "a fearful"),
+    ("အံ့ဩ", "a surprised"),
+    ("ယုံကြည်", "a confident"),
+    ("လေးနက်", "a serious"),
+    ("ဟာသ", "a humorous"),
+    ("ရှက်", "a shy"),
+]
+# Longest keys first, so a short key that happens to be a substring of
+# a longer one can never win the match.
+_GEMINI_STYLE_MAP.sort(key=lambda kv: -len(kv[0]))
+
+
+def _gemini_style_prefix(style: str) -> str:
+    """Compose the English director's-note prefix for a client style.
+
+    Returns "" for an empty style. A style containing a known Burmese
+    tone word becomes "Say in <english phrase> tone: "; a style that
+    already reads as an English instruction ("Say ...") is used as-is;
+    anything else (an English phrase, or a non-Latin style with no map
+    entry) is wrapped as "Say in this style (<style>): " so the model
+    still treats it as a direction rather than spoken content.
+    """
+    s = (style or "").strip()
+    if not s:
+        return ""
+    for key, phrase in _GEMINI_STYLE_MAP:
+        if key in s:
+            return f"Say in {phrase} tone: "
+    if s.lower().startswith("say"):
+        return f"{s}: "
+    return f"Say in this style ({s}): "
+
+
 def _pcm_to_wav(pcm: bytes, sample_rate: int, channels: int = 1,
                 bits_per_sample: int = 16) -> bytes:
     """Wrap raw PCM audio in a standard 44-byte WAV header."""
@@ -838,6 +907,132 @@ def _pcm_to_wav(pcm: bytes, sample_rate: int, channels: int = 1,
         b"data", struct.pack("<I", len(pcm)),
     ])
     return header + pcm
+
+
+def _clean_gemini_pcm(pcm: bytes, sample_rate: int) -> bytes:
+    """Trim edge junk from Gemini's raw PCM (16-bit little-endian mono).
+
+    Live captures show two artifacts: impulse spikes within the first
+    ~10 ms (then silence before the speech starts), and a short loud
+    DC-heavy segment that appears AFTER a >=200 ms silence gap
+    following the last speech — a detached trailing "blip" that sounds
+    like a click/thud at the very end. This trims leading spikes and
+    silence up to the first sustained speech, cuts everything after
+    the real speech end (+40 ms pad), and applies a 10 ms linear
+    fade-in / 15 ms linear fade-out at the cut points so the cuts
+    themselves never click.
+
+    Analysis uses 10 ms windows (per-window RMS and mean). The tail
+    walk skips windows that are quiet (rms <= 0.02) or DC-heavy
+    (|mean| > 0.04 and |mean| >= 0.3 * rms). One refinement over a
+    plain backward walk: a loud run detached from the speech by a
+    >=150 ms quiet gap whose windows lean DC ON AVERAGE is treated as
+    one artifact blip and skipped whole — in the captured fixture the
+    blip's individual windows straddle the 0.3 DC ratio, so a purely
+    per-window walk stops inside the junk. A detached run that does
+    NOT lean DC is kept (it could be a real final word after a pause).
+
+    Safety: if no sustained speech is found, or the trim would remove
+    more than 40% of the total duration, the original PCM is returned
+    unchanged. Samples in the middle are never modified (the fades
+    touch only the first 10 ms / last 15 ms of the kept region).
+    """
+    if sample_rate <= 0 or len(pcm) < 2:
+        return pcm
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    n = len(samples)
+    win = max(1, sample_rate // 100)  # 10 ms
+    nwin = n // win
+    if nwin < 10:
+        return pcm
+
+    rms = [0.0] * nwin
+    mean = [0.0] * nwin
+    for i in range(nwin):
+        seg = samples[i * win:(i + 1) * win]
+        total = 0
+        sq = 0
+        for x in seg:
+            total += x
+            sq += x * x
+        mean[i] = (total / win) / 32768.0
+        rms[i] = math.sqrt(sq / win) / 32768.0
+
+    LOUD = 0.02
+
+    def is_dc(i):
+        return abs(mean[i]) > 0.04 and abs(mean[i]) >= 0.3 * rms[i]
+
+    # Head: first window that is loud AND sustained (at least one of
+    # the next 3 windows also loud). A lone loud window — the opening
+    # spike — does not qualify. Keep from one window before it.
+    start_win = None
+    for i in range(nwin):
+        if rms[i] > LOUD and any(
+            rms[j] > LOUD for j in range(i + 1, min(i + 4, nwin))
+        ):
+            start_win = i
+            break
+    if start_win is None:
+        return pcm
+    start_sample = max(0, start_win - 1) * win
+
+    # Tail: last real speech window, searching backwards from `frm`.
+    def last_speech_win(frm):
+        i = frm
+        while i >= 0:
+            if rms[i] <= LOUD or is_dc(i):
+                i -= 1
+                continue
+            # Candidate end i: find the non-quiet block containing it
+            # and the quiet gap immediately before that block.
+            lo = i
+            while lo - 1 >= 0 and rms[lo - 1] > LOUD:
+                lo -= 1
+            hi = i
+            while hi + 1 < nwin and rms[hi + 1] > LOUD:
+                hi += 1
+            g = lo - 1
+            gap = 0
+            while g >= 0 and rms[g] <= LOUD:
+                gap += 1
+                g -= 1
+            if gap >= 15 and g >= 0:
+                block_mean = sum(mean[lo:hi + 1]) / (hi - lo + 1)
+                if abs(block_mean) > 0.04:
+                    # Detached DC-leaning blip, not speech: resume the
+                    # search at the last window before the gap. `g`
+                    # strictly decreases each hop, so this terminates.
+                    return last_speech_win(g)
+            return i
+        return None
+
+    end_win = last_speech_win(nwin - 1)
+    if end_win is None:
+        return pcm
+    pad = sample_rate * 40 // 1000  # 40 ms
+    end_sample = min(n, (end_win + 1) * win + pad)
+    if end_sample <= start_sample:
+        return pcm
+    if start_sample + (n - end_sample) > 0.40 * n:
+        return pcm
+    if start_sample == 0 and end_sample == n:
+        return pcm
+
+    kept = samples[start_sample:end_sample]
+    fade_in = min(sample_rate // 100, len(kept))  # 10 ms
+    for i in range(fade_in):
+        kept[i] = int(kept[i] * (i / fade_in))
+    fade_out = min(sample_rate * 15 // 1000, len(kept))  # 15 ms
+    base = len(kept) - fade_out
+    for i in range(fade_out):
+        kept[base + i] = int(kept[base + i] * ((fade_out - i) / fade_out))
+    if sys.byteorder == "big":
+        kept.byteswap()
+    return kept.tobytes()
 
 
 @app.get("/api/gemini/status")
@@ -885,6 +1080,10 @@ async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
             )
         style = req.style.strip()
 
+    # English director's-note form of the style ("" when no style):
+    # a raw Burmese style would be read aloud by the model as content.
+    style_prefix = _gemini_style_prefix(style)
+
     text = req.text.strip()
 
     if req.speakers is not None:
@@ -908,20 +1107,20 @@ async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
                        "line, prefixed with '<speaker>:' "
                        "(e.g. 'A: ...' and 'B: ...')",
             )
-        if style:
+        if style_prefix:
             # Prefix the direction onto the FIRST segment's text so the
             # direction itself is spoken by a speaker: a separate
             # leading part without speech_metadata would break the
             # multi-speaker rule that every part names its speaker.
-            parts[0]["text"] = f"{style}: {parts[0]['text']}"
+            parts[0]["text"] = style_prefix + parts[0]["text"]
     else:
         speech_config = {
             "voiceConfig": {
                 "prebuiltVoiceConfig": {"voiceName": req.voice},
             },
         }
-        if style:
-            text = f"{style}: {text}"
+        if style_prefix:
+            text = style_prefix + text
         parts = [{"text": text}]
 
     payload = {
@@ -984,14 +1183,18 @@ async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Gemini audio decode failed: {e}")
 
+    # Strip the edge junk Gemini sometimes returns (head spikes, a
+    # detached DC-heavy blip after the speech) before wrapping.
+    pcm = _clean_gemini_pcm(pcm, sample_rate)
+
     return Response(content=_pcm_to_wav(pcm, sample_rate), media_type="audio/wav")
 
 
 # --- Public edition routes (/api/pub/*) ---
-# Every route here requires (1) a valid Supabase access token and
-# (2) for the paid/quota engines, the visitor's OWN provider key in a
-# header. The server's env keys (HF_TOKEN / EL_API_KEY / GEMINI_API_KEY)
-# are never used by these routes and there is no fallback to them.
+# Every route here requires a valid Supabase access token. For the
+# paid/quota engines the provider key is resolved per request by
+# _resolve_pub_key (phase 11): Pro code (or owner login) -> the
+# server's env key; visitor key header -> the visitor's own key.
 
 _jwks_cache: dict = {"keys": None, "fetched_at": 0.0}
 JWKS_CACHE_SECONDS = 3600
@@ -1148,6 +1351,120 @@ def _require_byok_key(request: Request, header: str, service: str) -> str:
     return key
 
 
+# --- Phase 11: key/code resolution for the public Pro routes ---
+# A Pro call runs on exactly one key, resolved in this order:
+#   1. X-Pro-Code header present -> validate the code (existing rules,
+#      owner-email bypass included); valid -> the SERVER's env key.
+#      A presented code wins over a visitor key: an invalid code is a
+#      403 even when a visitor key is also sent.
+#   2. Caller is the owner (verified JWT email == OWNER_EMAIL) -> the
+#      server's env key, no code involved.
+#   3. Visitor key header present -> the visitor's own key; no code is
+#      read, validated or bound.
+#   4. Neither -> 401.
+# On the server-key paths (1-2) a missing env key is a 503 — the route
+# never silently falls back to anything else.
+
+_KEY_OR_CODE_401_MSG = (
+    "An API key or a Pro code is required. "
+    "(ကိုယ့် API Key ထည့်ပါ — ဒါမှမဟုတ် Pro Code သုံးပါ)"
+)
+
+_PRO_NOT_CONFIGURED_MSG = (
+    "Pro service is not configured on the server. "
+    "(Pro service ကို server မှာ မထည့်ထားပါ)"
+)
+
+_VOICE_OWNER_ONLY_MSG = (
+    "Adding or deleting voices needs your own ElevenLabs key. "
+    "(အသံ ထည့်/ဖျက် ချင်ရင် ကိုယ့် ElevenLabs key သုံးပါ)"
+)
+
+_EL_CAP_429_MSG = (
+    "Daily limit for Pro-code ElevenLabs use reached. "
+    "(Pro Code နဲ့ ElevenLabs သုံးတဲ့ နေ့စဉ် limit ပြည့်သွားပါပြီ)"
+)
+
+
+def _is_owner_email(user_email) -> bool:
+    """True when the verified JWT email is the owner's (OWNER_EMAIL,
+    case-insensitive). Disabled when OWNER_EMAIL is unset."""
+    return bool(
+        OWNER_EMAIL and user_email
+        and str(user_email).strip().lower() == OWNER_EMAIL.lower()
+    )
+
+
+async def _resolve_pub_key(request: Request, user_id: str,
+                           user_email: str, header_name: str,
+                           env_name: str):
+    """Resolve the provider key for a public Pro call (phase 11).
+
+    Returns (api_key, code, needs_bind, used_server_key); `code` and
+    `needs_bind` are the _require_pro_code results to hand to
+    _pro_code_touch after a successful call (None/False when no code
+    was involved). Raises 403 for an invalid presented code, 503 when
+    a server-key path has no env key configured, and 401 when the
+    caller brought neither a code nor a key.
+    """
+    if (request.headers.get("X-Pro-Code") or "").strip():
+        code, needs_bind = await _require_pro_code(
+            request, user_id, user_email)
+        env_key = (globals().get(env_name) or "").strip()
+        if not env_key:
+            raise HTTPException(status_code=503,
+                                detail=_PRO_NOT_CONFIGURED_MSG)
+        return env_key, code, needs_bind, True
+    if _is_owner_email(user_email):
+        env_key = (globals().get(env_name) or "").strip()
+        if not env_key:
+            raise HTTPException(status_code=503,
+                                detail=_PRO_NOT_CONFIGURED_MSG)
+        return env_key, None, False, True
+    visitor_key = (request.headers.get(header_name) or "").strip()
+    if visitor_key:
+        return visitor_key, None, False, False
+    raise HTTPException(status_code=401, detail=_KEY_OR_CODE_401_MSG)
+
+
+async def _pub_optional_code(request: Request, user_id: str,
+                             user_email: str):
+    """Code handling for the clone-job poll routes: they carry no
+    upstream key, so there is nothing to resolve — a presented
+    X-Pro-Code is validated (and later stamped) exactly as before,
+    but a caller without one (e.g. bring-your-own-key) may still poll
+    their own jobs; job ownership is the real gate there."""
+    if (request.headers.get("X-Pro-Code") or "").strip():
+        return await _require_pro_code(request, user_id, user_email)
+    return None, False
+
+
+# ElevenLabs daily char cap for server-key callers (phase 11):
+# user_id -> (UTC date ISO string, chars used that day). In-memory by
+# design — a restart resets the day count, never the other way.
+_el_server_daily: dict = {}
+
+
+def _el_server_cap_check(user_id: str, n_chars: int):
+    """429 when this server-key call would push the user past today's
+    ElevenLabs char cap (checked BEFORE the upstream call)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    day, used = _el_server_daily.get(user_id, (today, 0))
+    if day != today:
+        used = 0
+    if used + n_chars > SERVER_EL_DAILY_CHAR_CAP:
+        raise HTTPException(status_code=429, detail=_EL_CAP_429_MSG)
+
+
+def _el_server_cap_add(user_id: str, n_chars: int):
+    """Record a successful server-key ElevenLabs call's chars."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    day, used = _el_server_daily.get(user_id, (today, 0))
+    if day != today:
+        used = 0
+    _el_server_daily[user_id] = (today, used + n_chars)
+
+
 _pub_synth_hits_user: dict = {}
 _pub_synth_hits_ip: dict = {}
 
@@ -1210,23 +1527,31 @@ async def pub_synthesize(req: TTSRequest, request: Request):
 
 @app.post("/api/pub/el/tts")
 async def pub_el_tts(req: ELTTSRequest, request: Request):
-    """Public ElevenLabs TTS with the VISITOR's own key (X-EL-Key)."""
+    """Public ElevenLabs TTS. Key resolution (phase 11): a valid Pro
+    code or the owner runs on the server's key (daily char cap
+    applies); otherwise the visitor's own X-EL-Key, no code needed."""
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "el")
-    api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
-    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    api_key, code, needs_bind, server_key = await _resolve_pub_key(
+        request, user_id, user_email, "X-EL-Key", "EL_API_KEY")
+    if server_key:
+        _el_server_cap_check(user_id, len(req.text))
     resp = await _el_tts_core(req, api_key)
+    if server_key:
+        _el_server_cap_add(user_id, len(req.text))
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
 
 
 @app.get("/api/pub/el/voices")
 async def pub_el_voices(request: Request):
-    """List the voices on the VISITOR's own ElevenLabs account."""
+    """List cloned/professional voices on the resolved key's account:
+    the visitor's own (X-EL-Key), or the server's for a Pro-code /
+    owner caller — code users need to see the owner's clones."""
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "el")
-    api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
-    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    api_key, code, needs_bind, server_key = await _resolve_pub_key(
+        request, user_id, user_email, "X-EL-Key", "EL_API_KEY")
     resp = await _el_voices_core(api_key, own_only=True)
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
@@ -1234,13 +1559,17 @@ async def pub_el_voices(request: Request):
 
 @app.post("/api/pub/el/voices")
 async def pub_el_voice_add(request: Request, name: str = Form(...), sample: UploadFile = File(...)):
-    """Create a cloned voice on the VISITOR's own ElevenLabs account
-    (X-EL-Key): the same upstream call as the private route, with the
-    visitor's key. The server's EL_API_KEY is never used here."""
+    """Create a cloned voice with the resolved key (phase 11). On the
+    server-key path only the OWNER may create voices — a Pro-code
+    caller would otherwise add voices to the owner's account — so a
+    non-owner code user gets a 403 telling them to use their own key;
+    bring-your-own-key callers create on their own account as before."""
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "el")
-    api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
-    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    api_key, code, needs_bind, server_key = await _resolve_pub_key(
+        request, user_id, user_email, "X-EL-Key", "EL_API_KEY")
+    if server_key and not _is_owner_email(user_email):
+        raise HTTPException(status_code=403, detail=_VOICE_OWNER_ONLY_MSG)
     if not name or not name.strip():
         raise HTTPException(status_code=400, detail="Voice name is required")
     sample_bytes = await _read_upload_capped(sample)
@@ -1258,15 +1587,18 @@ async def pub_el_voice_add(request: Request, name: str = Form(...), sample: Uplo
 
 @app.delete("/api/pub/el/voices/{voice_id}")
 async def pub_el_voice_delete(voice_id: str, request: Request):
-    """Delete a voice from the VISITOR's own ElevenLabs account
-    (X-EL-Key). Only the visitor's own cloned/professional voices can
-    be deleted: the voice's category is checked with the visitor's key
+    """Delete a voice with the resolved key (phase 11). Only
+    cloned/professional voices can
+    be deleted: the voice's category is checked with the resolved key
     BEFORE the upstream delete is called, so premade voices get a
-    clean 400 here instead of an upstream delete error."""
+    clean 400 here instead of an upstream delete error. On the
+    server-key path only the OWNER may delete (phase 11)."""
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "el")
-    api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
-    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    api_key, code, needs_bind, server_key = await _resolve_pub_key(
+        request, user_id, user_email, "X-EL-Key", "EL_API_KEY")
+    if server_key and not _is_owner_email(user_email):
+        raise HTTPException(status_code=403, detail=_VOICE_OWNER_ONLY_MSG)
     voice = await _el_voice_lookup_core(voice_id, api_key)
     if voice.get("category") not in ("cloned", "professional"):
         raise HTTPException(
@@ -1280,11 +1612,13 @@ async def pub_el_voice_delete(voice_id: str, request: Request):
 
 @app.post("/api/pub/gemini/tts")
 async def pub_gemini_tts(req: GeminiTTSRequest, request: Request):
-    """Public Gemini TTS (3.8 contract) with the VISITOR's own key."""
+    """Public Gemini TTS (3.8 contract). Key resolution (phase 11):
+    Pro code / owner -> the server's key; otherwise the visitor's own
+    X-Gemini-Key, no code needed."""
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "gemini")
-    api_key = _require_byok_key(request, "X-Gemini-Key", "Gemini")
-    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    api_key, code, needs_bind, server_key = await _resolve_pub_key(
+        request, user_id, user_email, "X-Gemini-Key", "GEMINI_API_KEY")
     resp = await _gemini_tts_core(req, api_key)
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
@@ -1298,15 +1632,18 @@ async def pub_clone_job_create(
     speed: float = Form(1.0),
     ref_audio: UploadFile = File(...),
 ):
-    """Public clone job using the VISITOR's own HF token (X-HF-Token).
+    """Public clone job (phase 11 key resolution): a valid Pro code
+    or the owner runs the job on the server's HF_TOKEN; otherwise the
+    visitor's own X-HF-Token, no code needed.
 
-    The token is handed to the background job for its upstream calls
-    only; it is not written into the job entry or anywhere else.
+    The resolved token is handed to the background job for its
+    upstream calls only; it is not written into the job entry or
+    anywhere else.
     """
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "f5")
-    token = _require_byok_key(request, "X-HF-Token", "Hugging Face")
-    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    token, code, needs_bind, server_key = await _resolve_pub_key(
+        request, user_id, user_email, "X-HF-Token", "HF_TOKEN")
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
     if not ref_text.strip():
@@ -1336,7 +1673,7 @@ def _pub_job_or_404(job_id: str, user_id: str) -> dict:
 @app.get("/api/pub/clone/jobs/{job_id}")
 async def pub_clone_job_status(job_id: str, request: Request):
     user_id, user_email = await _require_pub_identity(request)
-    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    code, needs_bind = await _pub_optional_code(request, user_id, user_email)
     job = _pub_job_or_404(job_id, user_id)
     await _pro_code_touch(code, user_id, needs_bind)
     return _job_status_payload(job_id, job)
@@ -1345,7 +1682,7 @@ async def pub_clone_job_status(job_id: str, request: Request):
 @app.get("/api/pub/clone/jobs/{job_id}/audio")
 async def pub_clone_job_audio(job_id: str, request: Request):
     user_id, user_email = await _require_pub_identity(request)
-    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    code, needs_bind = await _pub_optional_code(request, user_id, user_email)
     job = _pub_job_or_404(job_id, user_id)
     if job["status"] != "done":
         raise HTTPException(status_code=409, detail=f"Job not ready: {job['status']}")
@@ -1358,8 +1695,9 @@ async def pub_clone_job_audio(job_id: str, request: Request):
 # require the X-Owner-Key header to match OWNER_KEY. The
 # /api/admin/* endpoints accept that key too, or alternatively the
 # owner's Supabase login (see _require_admin). When no admin path is
-# configured those routes return 503 (locked) rather than open. Pro
-# routes additionally require a valid Pro code (below).
+# configured those routes return 503 (locked) rather than open. The
+# public Pro routes use the codes below via _resolve_pub_key (phase
+# 11): a valid code is one way to run on the server's keys.
 
 def _require_owner(request: Request):
     """Gate for the owner's private paid routes (key only)."""
@@ -1593,7 +1931,7 @@ async def _pro_code_touch(code: str, user_id: str, bind: bool):
 # user (user_controls.disabled_modes). The public routes consult the
 # same table as a SOFT control: any store problem means "enabled".
 
-TTS_MODES = ("edge", "el", "gemini", "f5")
+TTS_MODES = ("edge", "el", "gemini", "f5", "vox")
 
 _MODE_DISABLED_MSG = (
     "This TTS engine is disabled by the admin. "
@@ -1911,3 +2249,205 @@ async def admin_users_set_controls(user_id: str, request: Request):
     if resp.status_code not in (200, 201):
         raise HTTPException(status_code=502, detail=_USER_SVC_502_MSG)
     return {"ok": True, "user_id": user_id, "disabled_modes": modes}
+
+
+# --- Feature settings + VoxCPM public mode (phase 12) ---
+# One app_settings row (key='features', jsonb value) holds the
+# admin-controlled feature flags. Today that is only the VoxCPM
+# session mode: vox_enabled (master switch) and vox_url (the live
+# Kaggle tunnel base URL — it changes on every session restart, so
+# the admin pastes the current one here instead of redeploying).
+# Reads FAIL CLOSED: any store problem means "off, no session", so a
+# Supabase outage can never open the mode by accident.
+#
+# The public VoxCPM routes proxy to the Kaggle notebook backend
+# (voxcpm2_kaggle_backend_2GPU.ipynb): POST {vox_url}/tts with a
+# multipart form — fields text (required), ref_text (transcript of
+# the reference clip, "" for reference-only cloning) and ref_audio
+# (the reference audio file) — and it answers audio/wav. The owner's
+# own login (OWNER_EMAIL) may use the mode even while the master
+# switch is off; a per-user admin disable ("vox" in user_controls)
+# still blocks any non-owner it is set on.
+
+_FEATURES_DEFAULT = {"vox_enabled": False, "vox_url": ""}
+
+_VOX_OFF_MSG = (
+    "VoxCPM is turned off by the admin. "
+    "(VoxCPM ကို admin က ပိတ်ထားပါတယ်)"
+)
+
+_VOX_NO_SESSION_MSG = (
+    "VoxCPM session is not available right now. "
+    "(VoxCPM session မရှိသေးပါ)"
+)
+
+_VOX_UPSTREAM_MSG = (
+    "VoxCPM session error — try again later. "
+    "(VoxCPM session အမှား ဖြစ်ပါတယ် — နောက်မှ ပြန် စမ်းပါ)"
+)
+
+_FEATURES_SVC_502_MSG = "Settings service unavailable"
+
+
+def _features_from_value(value) -> dict:
+    """Normalize a stored app_settings 'features' value."""
+    if not isinstance(value, dict):
+        return dict(_FEATURES_DEFAULT)
+    url = value.get("vox_url")
+    return {
+        "vox_enabled": bool(value.get("vox_enabled")),
+        "vox_url": url if isinstance(url, str) else "",
+    }
+
+
+async def _get_features() -> dict:
+    """Current feature settings. Fails CLOSED to all-off on any
+    error (unconfigured store, fetch failure, non-200, malformed
+    body, missing row)."""
+    if not _pro_store_configured():
+        return dict(_FEATURES_DEFAULT)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/app_settings",
+                params={"key": "eq.features", "select": "value"},
+                headers=_sb_headers(),
+            )
+    except Exception:
+        return dict(_FEATURES_DEFAULT)
+    if resp.status_code != 200:
+        return dict(_FEATURES_DEFAULT)
+    try:
+        rows = resp.json()
+    except Exception:
+        return dict(_FEATURES_DEFAULT)
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return _features_from_value(rows[0].get("value"))
+    return dict(_FEATURES_DEFAULT)
+
+
+async def _set_features(patch: dict) -> dict:
+    """Merge `patch` into the stored features row (upsert) and
+    return the stored dict."""
+    merged = _features_from_value({**await _get_features(), **patch})
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), trust_env=False) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/app_settings",
+                json={"key": "features", "value": merged},
+                headers={**_sb_headers(),
+                         "Prefer": "resolution=merge-duplicates,return=representation"},
+            )
+    except Exception:
+        raise HTTPException(status_code=502, detail=_FEATURES_SVC_502_MSG)
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=_FEATURES_SVC_502_MSG)
+    try:
+        rows = resp.json()
+    except Exception:
+        rows = None
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return _features_from_value(rows[0].get("value"))
+    return merged
+
+
+@app.get("/api/admin/settings")
+async def admin_settings_get(request: Request):
+    """Current feature settings (owner only)."""
+    await _require_admin(request)
+    _require_pro_store()
+    return await _get_features()
+
+
+@app.post("/api/admin/settings")
+async def admin_settings_post(request: Request):
+    """Patch feature settings (owner only). Body may include
+    vox_enabled (bool) and/or vox_url (string: "" or an https://
+    URL; trimmed before storing). Returns the stored dict."""
+    await _require_admin(request)
+    _require_pro_store()
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON body required")
+    patch: dict = {}
+    if "vox_enabled" in body:
+        if not isinstance(body["vox_enabled"], bool):
+            raise HTTPException(
+                status_code=400, detail="vox_enabled must be a boolean")
+        patch["vox_enabled"] = body["vox_enabled"]
+    if "vox_url" in body:
+        url = body["vox_url"]
+        if not isinstance(url, str):
+            raise HTTPException(
+                status_code=400, detail="vox_url must be a string")
+        url = url.strip()
+        if url and not url.startswith("https://"):
+            raise HTTPException(
+                status_code=400,
+                detail="vox_url must be empty or start with https://")
+        patch["vox_url"] = url
+    return await _set_features(patch)
+
+
+@app.get("/api/pub/vox/status")
+async def pub_vox_status(request: Request):
+    """Whether the VoxCPM mode is on for this caller (master switch
+    or the owner's login) and whether a session URL is set."""
+    user_id, user_email = await _require_pub_identity(request)
+    features = await _get_features()
+    return {
+        "enabled": bool(features["vox_enabled"]
+                        or _is_owner_email(user_email)),
+        "available": bool(features["vox_url"]),
+    }
+
+
+@app.post("/api/pub/vox/tts")
+async def pub_vox_tts(
+    request: Request,
+    text: str = Form(...),
+    ref_text: str = Form(""),
+    ref_audio: UploadFile = File(...),
+):
+    """VoxCPM voice-clone TTS: forwards the multipart form to the
+    Kaggle backend's POST /tts (fields text / ref_text / ref_audio,
+    exactly the notebook server's contract) and streams its WAV
+    back. Gated by the per-user disable list, the admin master
+    switch (owner's login excepted), and a live session URL."""
+    user_id, user_email = await _require_pub_identity(request)
+    await _check_mode_enabled(user_id, "vox")
+    features = await _get_features()
+    if not (features["vox_enabled"] or _is_owner_email(user_email)):
+        raise HTTPException(status_code=403, detail=_VOX_OFF_MSG)
+    base = features["vox_url"]
+    if not base:
+        raise HTTPException(status_code=503, detail=_VOX_NO_SESSION_MSG)
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Text is required")
+    audio_bytes = await _read_upload_capped(ref_audio)
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=400, detail="Reference audio file is empty")
+    files = {
+        "ref_audio": (
+            ref_audio.filename or "ref.wav",
+            audio_bytes,
+            ref_audio.content_type or "audio/wav",
+        ),
+    }
+    data = {"text": text.strip(), "ref_text": ref_text or ""}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0), trust_env=False) as client:
+            resp = await client.post(
+                base.rstrip("/") + "/tts", data=data, files=files)
+    except Exception:
+        raise HTTPException(status_code=502, detail=_VOX_UPSTREAM_MSG)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=_VOX_UPSTREAM_MSG)
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type") or "audio/wav",
+    )
