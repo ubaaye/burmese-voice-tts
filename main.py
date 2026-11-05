@@ -1477,7 +1477,15 @@ async def _require_pro_code(request: Request, user_id: str,
     revoked, bound to a different user id, or issued for a different
     login email (bound_email, compared case-insensitively) than the
     caller's verified JWT email.
+
+    Owner bypass: when the caller's verified JWT email equals
+    OWNER_EMAIL (case-insensitive), the check passes immediately with
+    (None, False) — no code is required, a presented code is ignored,
+    and no code row is touched. Disabled when OWNER_EMAIL is unset.
     """
+    if OWNER_EMAIL and user_email \
+            and user_email.strip().lower() == OWNER_EMAIL.lower():
+        return None, False
     if not _pro_store_configured():
         raise HTTPException(
             status_code=503,
@@ -1507,7 +1515,10 @@ async def _pro_code_touch(code: str, user_id: str, bind: bool):
     """Best-effort bookkeeping after a successful Pro call: stamp
     last_used_at, and bind the code to this user on first use. A stamp
     failure never fails the request, and the code value is not logged.
+    A None code (owner bypass) touches no row at all.
     """
+    if code is None:
+        return
     body: dict = {"last_used_at": datetime.now(timezone.utc).isoformat()}
     if bind:
         body["bound_user_id"] = user_id
