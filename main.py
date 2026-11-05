@@ -98,7 +98,7 @@ OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "").strip()
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB cap on audio uploads
 MAX_TEXT_CHARS = 5000  # blunt backstop on EL/Gemini text (app limits are lower)
 PUB_SYNTH_MAX_CHARS = 600  # per-request cap on the free public Edge route
-PUB_SYNTH_LIMIT = 30  # requests per window, per user and (secondary) per IP
+PUB_SYNTH_LIMIT = 120  # requests per window, per user and (secondary) per IP
 PUB_SYNTH_WINDOW = 3600  # 1 hour
 JOB_TTL_SECONDS = 1800  # finished clone jobs (and their audio) expire after 30 min
 
@@ -524,8 +524,16 @@ async def el_tts(req: ELTTSRequest, request: Request):
     return await _el_tts_core(req, EL_API_KEY)
 
 
-async def _el_voices_core(api_key: str):
-    """List ElevenLabs voices available to the given key."""
+async def _el_voices_core(api_key: str, own_only: bool = False):
+    """List ElevenLabs voices available to the given key.
+
+    With own_only=True (the public route), only voices owned by the
+    key's account are returned: ElevenLabs marks those as category
+    "cloned" or "professional". Premade/generated voices (and items
+    with no category at all) are excluded — they are not the visitor's
+    own clones and cannot be managed or reliably used through the
+    public app.
+    """
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
             resp = await client.get(
@@ -543,15 +551,20 @@ async def _el_voices_core(api_key: str):
             detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
         )
     data = resp.json()
-    voices = [
-        {
-            "voice_id": v.get("voice_id"),
-            "name": v.get("name"),
-            "category": v.get("category"),
-        }
-        for v in data.get("voices", [])
-        if isinstance(v, dict)
-    ]
+    voices = []
+    for v in data.get("voices", []):
+        if not isinstance(v, dict):
+            continue
+        category = v.get("category")
+        if own_only and category not in ("cloned", "professional"):
+            continue
+        voices.append(
+            {
+                "voice_id": v.get("voice_id"),
+                "name": v.get("name"),
+                "category": category,
+            }
+        )
     return {"voices": voices}
 
 
@@ -593,6 +606,37 @@ async def _el_voice_add_core(name: str, sample_bytes: bytes, filename: str,
         )
     data = resp.json()
     return {"voice_id": data.get("voice_id"), "name": name}
+
+
+async def _el_voice_lookup_core(voice_id: str, api_key: str):
+    """Fetch one ElevenLabs voice using the given key. A missing voice
+    surfaces as a clean bilingual 404 (not the raw upstream error)."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            resp = await client.get(
+                f"{EL_BASE}/v1/voices/{voice_id}",
+                headers={"xi-api-key": api_key},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs service error: {e}")
+
+    if resp.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail="Voice not found. (အသံ မတွေ့ပါ)",
+        )
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
+        )
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    return data if isinstance(data, dict) else {}
 
 
 async def _el_voice_delete_core(voice_id: str, api_key: str):
@@ -1183,7 +1227,7 @@ async def pub_el_voices(request: Request):
     await _check_mode_enabled(user_id, "el")
     api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
     code, needs_bind = await _require_pro_code(request, user_id, user_email)
-    resp = await _el_voices_core(api_key)
+    resp = await _el_voices_core(api_key, own_only=True)
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
 
@@ -1215,12 +1259,20 @@ async def pub_el_voice_add(request: Request, name: str = Form(...), sample: Uplo
 @app.delete("/api/pub/el/voices/{voice_id}")
 async def pub_el_voice_delete(voice_id: str, request: Request):
     """Delete a voice from the VISITOR's own ElevenLabs account
-    (X-EL-Key). Only voices that key owns can be deleted — ElevenLabs
-    itself rejects anything else, and the error surfaces upstream's."""
+    (X-EL-Key). Only the visitor's own cloned/professional voices can
+    be deleted: the voice's category is checked with the visitor's key
+    BEFORE the upstream delete is called, so premade voices get a
+    clean 400 here instead of an upstream delete error."""
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "el")
     api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
     code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    voice = await _el_voice_lookup_core(voice_id, api_key)
+    if voice.get("category") not in ("cloned", "professional"):
+        raise HTTPException(
+            status_code=400,
+            detail="This voice cannot be deleted. (ဒီ အသံ ကို ဖျက်လို့ မရပါ)",
+        )
     await _el_voice_delete_core(voice_id, api_key)
     await _pro_code_touch(code, user_id, needs_bind)
     return {"ok": True}
