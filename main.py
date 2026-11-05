@@ -963,6 +963,49 @@ def _gemini_style_tag(style: str) -> str:
     return f"[{s}] "
 
 
+# A USER TAG is a bracketed group at the very start of a line (after
+# optional leading spaces): letters, spaces and hyphens only, e.g.
+# "[bored]" or "[cheerful and friendly]". Users type these to style one
+# line at a time; the model treats them as markup anywhere in the text.
+# Only line-leading brackets count — a bracket mid-line is content.
+_USER_TAG_LINE_RE = re.compile(r"^\s*\[([A-Za-z][A-Za-z \-]{0,40})\]")
+
+
+def _first_user_tag_offset(text: str):
+    """Character offset of the start of the first line that opens with
+    a user tag, or None when the text has no user tag."""
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        if _USER_TAG_LINE_RE.match(line):
+            return offset
+        offset += len(line)
+    return None
+
+
+def _starts_with_user_tag(text: str) -> bool:
+    return bool(_USER_TAG_LINE_RE.match(text or ""))
+
+
+def _apply_style_tag_single(text: str, style_tag: str) -> str:
+    """Combine the global style tag with a single-voice text body.
+
+    No user tags -> global tag prepended exactly as before. With user
+    tags: the global tag is prepended ONLY when real (non-tag) text
+    precedes the first user tag — when the text opens with a user tag,
+    that tag governs from the start and a prepended global tag would
+    fight it, so it is skipped. User tags stay inline verbatim either
+    way. An empty style_tag returns the text untouched.
+    """
+    if not style_tag:
+        return text
+    tag_at = _first_user_tag_offset(text)
+    if tag_at is None:
+        return style_tag + text
+    if text[:tag_at].strip():
+        return style_tag + text
+    return text
+
+
 def _pcm_to_wav(pcm: bytes, sample_rate: int, channels: int = 1,
                 bits_per_sample: int = 16) -> bytes:
     """Wrap raw PCM audio in a standard 44-byte WAV header."""
@@ -1183,15 +1226,20 @@ async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
             # it rides on a part that names its speaker: a separate
             # leading part without speech_metadata would break the
             # multi-speaker rule that every part names its speaker.
-            parts[0]["text"] = style_tag + parts[0]["text"]
+            # Don't double-tag: when the first segment already opens
+            # with the user's own per-line tag, that tag governs and
+            # the global tag is skipped for this part.
+            if not _starts_with_user_tag(parts[0]["text"]):
+                parts[0]["text"] = style_tag + parts[0]["text"]
     else:
         speech_config = {
             "voiceConfig": {
                 "prebuiltVoiceConfig": {"voiceName": req.voice},
             },
         }
-        if style_tag:
-            text = style_tag + text
+        # Wire format stays ONE text part; per-line user tags ride
+        # inline (see _apply_style_tag_single for the combination rule).
+        text = _apply_style_tag_single(text, style_tag)
         parts = [{"text": text}]
 
     payload = {
