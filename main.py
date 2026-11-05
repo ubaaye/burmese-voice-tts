@@ -1034,11 +1034,13 @@ async def _verify_supabase_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail=_PUB_401_MSG)
 
 
-async def _require_pub_user(request: Request) -> str:
-    """Gate for every /api/pub/* route; returns the user's id (sub).
+async def _require_pub_identity(request: Request):
+    """Gate for every /api/pub/* route; returns (user_id, email).
 
-    Fails CLOSED: when SUPABASE_URL is not configured (or the JWT
-    library is missing) the public routes return 503 — never open.
+    The email is the JWT's verified email claim, lowercased, or None
+    when the token carries none. Fails CLOSED: when SUPABASE_URL is
+    not configured (or the JWT library is missing) the public routes
+    return 503 — never open.
     """
     if not SUPABASE_URL or _pyjwt is None:
         raise HTTPException(
@@ -1059,7 +1061,15 @@ async def _require_pub_user(request: Request) -> str:
     sub = payload.get("sub")
     if not sub:
         raise HTTPException(status_code=401, detail=_PUB_401_MSG)
-    return str(sub)
+    email = payload.get("email")
+    email = str(email).strip().lower() if email else None
+    return str(sub), email
+
+
+async def _require_pub_user(request: Request) -> str:
+    """Gate for the free public route; returns the user's id (sub)."""
+    user_id, _email = await _require_pub_identity(request)
+    return user_id
 
 
 def _require_byok_key(request: Request, header: str, service: str) -> str:
@@ -1142,9 +1152,9 @@ async def pub_synthesize(req: TTSRequest, request: Request):
 @app.post("/api/pub/el/tts")
 async def pub_el_tts(req: ELTTSRequest, request: Request):
     """Public ElevenLabs TTS with the VISITOR's own key (X-EL-Key)."""
-    user_id = await _require_pub_user(request)
+    user_id, user_email = await _require_pub_identity(request)
     api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
-    code, needs_bind = await _require_pro_code(request, user_id)
+    code, needs_bind = await _require_pro_code(request, user_id, user_email)
     resp = await _el_tts_core(req, api_key)
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
@@ -1153,9 +1163,9 @@ async def pub_el_tts(req: ELTTSRequest, request: Request):
 @app.get("/api/pub/el/voices")
 async def pub_el_voices(request: Request):
     """List the voices on the VISITOR's own ElevenLabs account."""
-    user_id = await _require_pub_user(request)
+    user_id, user_email = await _require_pub_identity(request)
     api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
-    code, needs_bind = await _require_pro_code(request, user_id)
+    code, needs_bind = await _require_pro_code(request, user_id, user_email)
     resp = await _el_voices_core(api_key)
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
@@ -1164,9 +1174,9 @@ async def pub_el_voices(request: Request):
 @app.post("/api/pub/gemini/tts")
 async def pub_gemini_tts(req: GeminiTTSRequest, request: Request):
     """Public Gemini TTS (3.8 contract) with the VISITOR's own key."""
-    user_id = await _require_pub_user(request)
+    user_id, user_email = await _require_pub_identity(request)
     api_key = _require_byok_key(request, "X-Gemini-Key", "Gemini")
-    code, needs_bind = await _require_pro_code(request, user_id)
+    code, needs_bind = await _require_pro_code(request, user_id, user_email)
     resp = await _gemini_tts_core(req, api_key)
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
@@ -1185,9 +1195,9 @@ async def pub_clone_job_create(
     The token is handed to the background job for its upstream calls
     only; it is not written into the job entry or anywhere else.
     """
-    user_id = await _require_pub_user(request)
+    user_id, user_email = await _require_pub_identity(request)
     token = _require_byok_key(request, "X-HF-Token", "Hugging Face")
-    code, needs_bind = await _require_pro_code(request, user_id)
+    code, needs_bind = await _require_pro_code(request, user_id, user_email)
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
     if not ref_text.strip():
@@ -1216,8 +1226,8 @@ def _pub_job_or_404(job_id: str, user_id: str) -> dict:
 
 @app.get("/api/pub/clone/jobs/{job_id}")
 async def pub_clone_job_status(job_id: str, request: Request):
-    user_id = await _require_pub_user(request)
-    code, needs_bind = await _require_pro_code(request, user_id)
+    user_id, user_email = await _require_pub_identity(request)
+    code, needs_bind = await _require_pro_code(request, user_id, user_email)
     job = _pub_job_or_404(job_id, user_id)
     await _pro_code_touch(code, user_id, needs_bind)
     return _job_status_payload(job_id, job)
@@ -1225,8 +1235,8 @@ async def pub_clone_job_status(job_id: str, request: Request):
 
 @app.get("/api/pub/clone/jobs/{job_id}/audio")
 async def pub_clone_job_audio(job_id: str, request: Request):
-    user_id = await _require_pub_user(request)
-    code, needs_bind = await _require_pro_code(request, user_id)
+    user_id, user_email = await _require_pub_identity(request)
+    code, needs_bind = await _require_pro_code(request, user_id, user_email)
     job = _pub_job_or_404(job_id, user_id)
     if job["status"] != "done":
         raise HTTPException(status_code=409, detail=f"Job not ready: {job['status']}")
@@ -1317,7 +1327,7 @@ _PRO_403_MSG = (
     "code မှန်မှ သုံးလို့ရပါတယ်)"
 )
 
-_PRO_SELECT = "code,label,bound_user_id,active,created_at,last_used_at"
+_PRO_SELECT = "code,label,bound_user_id,bound_email,active,created_at,last_used_at"
 
 
 def _sb_headers() -> dict:
@@ -1370,12 +1380,15 @@ async def _sb_codes_patch(code: str, body: dict) -> list:
     return rows if isinstance(rows, list) else []
 
 
-async def _sb_codes_insert(code: str, label: str) -> dict:
+async def _sb_codes_insert(code: str, label: str, bound_email=None) -> dict:
+    body: dict = {"code": code, "label": label}
+    if bound_email:
+        body["bound_email"] = bound_email
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), trust_env=False) as client:
             resp = await client.post(
                 f"{SUPABASE_URL}/rest/v1/pro_codes",
-                json={"code": code, "label": label},
+                json=body,
                 headers={**_sb_headers(), "Prefer": "return=representation"},
             )
     except Exception:
@@ -1385,7 +1398,8 @@ async def _sb_codes_insert(code: str, label: str) -> dict:
     rows = resp.json()
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         return rows[0]
-    return {"code": code, "label": label, "created_at": None}
+    return {"code": code, "label": label, "created_at": None,
+            "bound_email": bound_email}
 
 
 async def _sb_codes_list() -> list:
@@ -1404,12 +1418,15 @@ async def _sb_codes_list() -> list:
     return rows if isinstance(rows, list) else []
 
 
-async def _require_pro_code(request: Request, user_id: str):
+async def _require_pro_code(request: Request, user_id: str,
+                            user_email: str = None):
     """Validate the caller's Pro code (X-Pro-Code header).
 
     Returns (code, needs_bind). Raises 503 when the pro store is not
     configured, 403 when the code is missing, malformed, unknown,
-    revoked, or bound to a different user.
+    revoked, bound to a different user id, or issued for a different
+    login email (bound_email, compared case-insensitively) than the
+    caller's verified JWT email.
     """
     if not _pro_store_configured():
         raise HTTPException(
@@ -1430,6 +1447,9 @@ async def _require_pro_code(request: Request, user_id: str):
     bound = row.get("bound_user_id")
     if bound and str(bound) != user_id:
         raise HTTPException(status_code=403, detail=_PRO_403_MSG)
+    bound_email = row.get("bound_email")
+    if bound_email and str(bound_email).strip().lower() != (user_email or ""):
+        raise HTTPException(status_code=403, detail=_PRO_403_MSG)
     return code, bound is None
 
 
@@ -1449,6 +1469,7 @@ async def _pro_code_touch(code: str, user_id: str, bind: bool):
 
 class AdminCodeCreate(BaseModel):
     label: str = ""
+    email: str = ""
 
 
 def _require_pro_store():
@@ -1465,6 +1486,7 @@ def _public_code_row(row: dict) -> dict:
         "code": row.get("code"),
         "label": row.get("label"),
         "bound_user_id": row.get("bound_user_id"),
+        "bound_email": row.get("bound_email"),
         "active": bool(row.get("active")),
         "created_at": row.get("created_at"),
         "last_used_at": row.get("last_used_at"),
@@ -1473,14 +1495,25 @@ def _public_code_row(row: dict) -> dict:
 
 @app.post("/api/admin/codes")
 async def admin_codes_create(req: AdminCodeCreate, request: Request):
-    """Issue a new Pro code (owner only)."""
+    """Issue a new Pro code (owner only).
+
+    An optional email issues the code FOR that user's login gmail:
+    it is stored (trimmed, lowercased) as bound_email, and becomes
+    the label when no label was given. Without an email the code is
+    unbound and binds to its first user as before.
+    """
     await _require_admin(request)
     _require_pro_store()
     code = str(uuid.uuid4())
-    row = await _sb_codes_insert(code, (req.label or "").strip())
+    email = (req.email or "").strip().lower()
+    label = (req.label or "").strip()
+    if email and not label:
+        label = email
+    row = await _sb_codes_insert(code, label, email or None)
     return {
         "code": row.get("code", code),
-        "label": row.get("label", (req.label or "").strip()),
+        "label": row.get("label", label),
+        "bound_email": row.get("bound_email", email or None),
         "created_at": row.get("created_at"),
     }
 
