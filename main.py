@@ -1494,9 +1494,14 @@ _PRO_NOT_CONFIGURED_MSG = (
     "(Pro service ကို server မှာ မထည့်ထားပါ)"
 )
 
-_VOICE_OWNER_ONLY_MSG = (
-    "Adding or deleting voices needs your own ElevenLabs key. "
-    "(အသံ ထည့်/ဖျက် ချင်ရင် ကိုယ့် ElevenLabs key သုံးပါ)"
+_EL_DEFAULT_PROTECTED_MSG = (
+    "The default voice (NLO MyVoice v2) is protected and "
+    "cannot be deleted. (မူလ အသံကို ဖျက်၍ မရပါ)"
+)
+
+_EL_DELETE_OWN_ONLY_MSG = (
+    "You can delete only ElevenLabs voices you created. "
+    "(ကိုယ်တိုင် ဖန်တီးထားတဲ့ ElevenLabs အသံပဲ ဖျက်လို့ရပါတယ်)"
 )
 
 _EL_CAP_429_MSG = (
@@ -1666,29 +1671,34 @@ async def pub_el_tts(req: ELTTSRequest, request: Request):
 async def pub_el_voices(request: Request):
     """List cloned/professional voices on the resolved key's account:
     the visitor's own (X-EL-Key), or the server's for a Pro-code /
-    owner caller — code users need to see the owner's clones."""
+    owner caller. A server-key non-owner also gets the ids of the
+    voices that user created on the shared account, so the app can
+    show those voices next to the shared "NLO" clone without exposing
+    the owner's other clones."""
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "el")
     api_key, code, needs_bind, server_key = await _resolve_pub_key(
         request, user_id, user_email, "X-EL-Key", "EL_API_KEY")
     resp = await _el_voices_core(api_key, own_only=True)
+    if server_key and not _is_owner_email(user_email):
+        mapping = await _get_el_user_voices()
+        resp["created_voice_ids"] = list(mapping.get(user_id, []))
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
 
 
 @app.post("/api/pub/el/voices")
 async def pub_el_voice_add(request: Request, name: str = Form(...), sample: UploadFile = File(...)):
-    """Create a cloned voice with the resolved key (phase 11). On the
-    server-key path only the OWNER may create voices — a Pro-code
-    caller would otherwise add voices to the owner's account — so a
-    non-owner code user gets a 403 telling them to use their own key;
-    bring-your-own-key callers create on their own account as before."""
+    """Create a cloned voice with the resolved key. A Pro-code caller
+    creates the voice on the owner's shared ElevenLabs account, so
+    the new voice id is tracked against that user: the voice list
+    route then exposes it only to its creator (next to the shared
+    "NLO" clone) and the delete route lets only its creator remove
+    it. The owner and bring-your-own-key callers need no tracking."""
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "el")
     api_key, code, needs_bind, server_key = await _resolve_pub_key(
         request, user_id, user_email, "X-EL-Key", "EL_API_KEY")
-    if server_key and not _is_owner_email(user_email):
-        raise HTTPException(status_code=403, detail=_VOICE_OWNER_ONLY_MSG)
     if not name or not name.strip():
         raise HTTPException(status_code=400, detail="Voice name is required")
     sample_bytes = await _read_upload_capped(sample)
@@ -1700,24 +1710,37 @@ async def pub_el_voice_add(request: Request, name: str = Form(...), sample: Uplo
         sample.content_type or "audio/mpeg",
         api_key,
     )
+    if server_key and not _is_owner_email(user_email):
+        new_voice_id = resp.get("voice_id") if isinstance(resp, dict) else None
+        if new_voice_id:
+            await _el_voice_track(user_id, new_voice_id)
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
 
 
 @app.delete("/api/pub/el/voices/{voice_id}")
 async def pub_el_voice_delete(voice_id: str, request: Request):
-    """Delete a voice with the resolved key (phase 11). Only
-    cloned/professional voices can
-    be deleted: the voice's category is checked with the resolved key
+    """Delete a voice with the resolved key. The shared default
+    voice is hard-protected on this route for everyone. A server-key
+    non-owner (Pro-code caller) may delete ONLY voices tracked as
+    that user's own creations; the owner and bring-your-own-key
+    callers are unchanged. Only cloned/professional voices can be
+    deleted: the voice's category is checked with the resolved key
     BEFORE the upstream delete is called, so premade voices get a
-    clean 400 here instead of an upstream delete error. On the
-    server-key path only the OWNER may delete (phase 11)."""
+    clean 400 here instead of an upstream delete error."""
     user_id, user_email = await _require_pub_identity(request)
     await _check_mode_enabled(user_id, "el")
     api_key, code, needs_bind, server_key = await _resolve_pub_key(
         request, user_id, user_email, "X-EL-Key", "EL_API_KEY")
-    if server_key and not _is_owner_email(user_email):
-        raise HTTPException(status_code=403, detail=_VOICE_OWNER_ONLY_MSG)
+    if voice_id == EL_DEFAULT_VOICE_ID:
+        raise HTTPException(status_code=403,
+                            detail=_EL_DEFAULT_PROTECTED_MSG)
+    is_owner = _is_owner_email(user_email)
+    if server_key and not is_owner:
+        mapping = await _get_el_user_voices()
+        if voice_id not in mapping.get(user_id, []):
+            raise HTTPException(status_code=403,
+                                detail=_EL_DELETE_OWN_ONLY_MSG)
     voice = await _el_voice_lookup_core(voice_id, api_key)
     if voice.get("category") not in ("cloned", "professional"):
         raise HTTPException(
@@ -1725,6 +1748,8 @@ async def pub_el_voice_delete(voice_id: str, request: Request):
             detail="This voice cannot be deleted. (ဒီ အသံ ကို ဖျက်လို့ မရပါ)",
         )
     await _el_voice_delete_core(voice_id, api_key)
+    if server_key and not is_owner:
+        await _el_voice_untrack(user_id, voice_id)
     await _pro_code_touch(code, user_id, needs_bind)
     return {"ok": True}
 
@@ -2468,6 +2493,113 @@ async def _set_features(patch: dict) -> dict:
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         return _features_from_value(rows[0].get("value"))
     return merged
+
+
+# --- Per-user ElevenLabs voice ownership (public Pro routes) ---
+# One app_settings row (key='el_user_voices', jsonb value) maps a
+# Supabase user id to the ElevenLabs voice ids that user created
+# while running on the owner's shared server key (the Pro-code
+# path): {user_id: [voice_id, ...]}. The public EL voice routes use
+# it to show each code user only the shared "NLO" clone plus their
+# own creations, and to let them delete only those creations.
+# Reads and writes are best-effort: any store problem means "no
+# tracked voices", so an outage can never expose another user's
+# voices or block the owner's / bring-your-own-key paths.
+
+_EL_USER_VOICES_KEY = "el_user_voices"
+
+
+def _el_user_voices_from_value(value) -> dict:
+    """Normalize a stored app_settings 'el_user_voices' value to
+    {user_id: [voice_id, ...]} with string ids, de-duplicated."""
+    if not isinstance(value, dict):
+        return {}
+    clean = {}
+    for user_id, voice_ids in value.items():
+        if not isinstance(user_id, str) or not user_id:
+            continue
+        if not isinstance(voice_ids, list):
+            continue
+        ids = []
+        for voice_id in voice_ids:
+            if isinstance(voice_id, str) and voice_id and voice_id not in ids:
+                ids.append(voice_id)
+        if ids:
+            clean[user_id] = ids
+    return clean
+
+
+async def _get_el_user_voices() -> dict:
+    """Current per-user created-voice mapping. FAILS OPEN to {}
+    on any error (unconfigured store, fetch failure, non-200,
+    malformed body, missing row)."""
+    if not _pro_store_configured():
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/app_settings",
+                params={"key": f"eq.{_EL_USER_VOICES_KEY}", "select": "value"},
+                headers=_sb_headers(),
+            )
+    except Exception:
+        return {}
+    if resp.status_code != 200:
+        return {}
+    try:
+        rows = resp.json()
+    except Exception:
+        return {}
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return _el_user_voices_from_value(rows[0].get("value"))
+    return {}
+
+
+async def _set_el_user_voices(mapping: dict):
+    """Upsert the per-user created-voice mapping. Best-effort:
+    every store error is swallowed (tracking must never fail a
+    voice create/delete that already succeeded upstream)."""
+    clean = _el_user_voices_from_value(mapping)
+    if not _pro_store_configured():
+        return
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), trust_env=False) as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/app_settings",
+                json={"key": _EL_USER_VOICES_KEY, "value": clean},
+                headers={**_sb_headers(),
+                         "Prefer": "resolution=merge-duplicates,return=representation"},
+            )
+    except Exception:
+        return
+
+
+async def _el_voice_track(user_id: str, voice_id: str):
+    """Record `voice_id` as created by `user_id` (no duplicates)."""
+    if not user_id or not voice_id:
+        return
+    mapping = await _get_el_user_voices()
+    ids = mapping.setdefault(user_id, [])
+    if voice_id not in ids:
+        ids.append(voice_id)
+        await _set_el_user_voices(mapping)
+
+
+async def _el_voice_untrack(user_id: str, voice_id: str):
+    """Drop `voice_id` from `user_id`'s created list (and the user
+    entry itself once it is empty)."""
+    if not user_id or not voice_id:
+        return
+    mapping = await _get_el_user_voices()
+    ids = mapping.get(user_id)
+    if not ids or voice_id not in ids:
+        return
+    ids = [v for v in ids if v != voice_id]
+    if ids:
+        mapping[user_id] = ids
+    else:
+        mapping.pop(user_id, None)
+    await _set_el_user_voices(mapping)
 
 
 @app.get("/api/admin/settings")
