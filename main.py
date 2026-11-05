@@ -567,6 +567,55 @@ async def el_voices_list(request: Request):
     return await _el_voices_core(EL_API_KEY)
 
 
+async def _el_voice_add_core(name: str, sample_bytes: bytes, filename: str,
+                             mime: str, api_key: str):
+    """Create an ElevenLabs cloned (IVC) voice using the given key
+    (server key, or a visitor's own key on the public route). The key
+    is used for this call only. Upstream errors surface exactly like
+    _el_tts_core's."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            resp = await client.post(
+                EL_BASE + "/v1/voices/add",
+                data={"name": name},
+                files={"files": (filename, sample_bytes, mime)},
+                headers={"xi-api-key": api_key},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs service error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
+        )
+    data = resp.json()
+    return {"voice_id": data.get("voice_id"), "name": name}
+
+
+async def _el_voice_delete_core(voice_id: str, api_key: str):
+    """Delete an ElevenLabs voice using the given key (server key, or
+    a visitor's own key on the public route)."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            resp = await client.delete(
+                f"{EL_BASE}/v1/voices/{voice_id}",
+                headers={"xi-api-key": api_key},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs service error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
+        )
+
+
 @app.post("/api/el/voices")
 async def el_voices_add(request: Request, name: str = Form(...), sample: UploadFile = File(...)):
     """Create a new ElevenLabs cloned voice from an uploaded audio sample."""
@@ -583,32 +632,12 @@ async def el_voices_add(request: Request, name: str = Form(...), sample: UploadF
     if not sample_bytes:
         raise HTTPException(status_code=400, detail="Sample audio file is empty")
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
-            resp = await client.post(
-                EL_BASE + "/v1/voices/add",
-                data={"name": name.strip()},
-                files={
-                    "files": (
-                        sample.filename or "sample.mp3",
-                        sample_bytes,
-                        sample.content_type or "audio/mpeg",
-                    )
-                },
-                headers={"xi-api-key": EL_API_KEY},
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"ElevenLabs service error: {e}")
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
-        )
-    data = resp.json()
-    return {"voice_id": data.get("voice_id"), "name": name.strip()}
+    return await _el_voice_add_core(
+        name.strip(), sample_bytes,
+        sample.filename or "sample.mp3",
+        sample.content_type or "audio/mpeg",
+        EL_API_KEY,
+    )
 
 
 @app.delete("/api/el/voices/{voice_id}")
@@ -628,22 +657,7 @@ async def el_voices_delete(voice_id: str, request: Request):
             status_code=503,
             detail="ElevenLabs is not configured on the server (EL_API_KEY missing)",
         )
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-            resp = await client.delete(
-                f"{EL_BASE}/v1/voices/{voice_id}",
-                headers={"xi-api-key": EL_API_KEY},
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"ElevenLabs service error: {e}")
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"ElevenLabs error ({resp.status_code}): {_el_error_detail(resp)}",
-        )
+    await _el_voice_delete_core(voice_id, EL_API_KEY)
     return {"deleted": True, "voice_id": voice_id}
 
 
@@ -1169,6 +1183,42 @@ async def pub_el_voices(request: Request):
     resp = await _el_voices_core(api_key)
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
+
+
+@app.post("/api/pub/el/voices")
+async def pub_el_voice_add(request: Request, name: str = Form(...), sample: UploadFile = File(...)):
+    """Create a cloned voice on the VISITOR's own ElevenLabs account
+    (X-EL-Key): the same upstream call as the private route, with the
+    visitor's key. The server's EL_API_KEY is never used here."""
+    user_id, user_email = await _require_pub_identity(request)
+    api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
+    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    if not name or not name.strip():
+        raise HTTPException(status_code=400, detail="Voice name is required")
+    sample_bytes = await _read_upload_capped(sample)
+    if not sample_bytes:
+        raise HTTPException(status_code=400, detail="Sample audio file is empty")
+    resp = await _el_voice_add_core(
+        name.strip(), sample_bytes,
+        sample.filename or "sample.mp3",
+        sample.content_type or "audio/mpeg",
+        api_key,
+    )
+    await _pro_code_touch(code, user_id, needs_bind)
+    return resp
+
+
+@app.delete("/api/pub/el/voices/{voice_id}")
+async def pub_el_voice_delete(voice_id: str, request: Request):
+    """Delete a voice from the VISITOR's own ElevenLabs account
+    (X-EL-Key). Only voices that key owns can be deleted — ElevenLabs
+    itself rejects anything else, and the error surfaces upstream's."""
+    user_id, user_email = await _require_pub_identity(request)
+    api_key = _require_byok_key(request, "X-EL-Key", "ElevenLabs")
+    code, needs_bind = await _require_pro_code(request, user_id, user_email)
+    await _el_voice_delete_core(voice_id, api_key)
+    await _pro_code_touch(code, user_id, needs_bind)
+    return {"ok": True}
 
 
 @app.post("/api/pub/gemini/tts")
