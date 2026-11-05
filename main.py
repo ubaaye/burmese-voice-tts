@@ -726,12 +726,13 @@ class GeminiTTSRequest(BaseModel):
     # validated manually in the handler so ANY malformed speakers payload
     # returns a clear HTTP 400 instead of a pydantic 422.
     speakers: Any = None
-    # Optional tone/style instruction (e.g. "Say cheerfully and slowly").
-    # When non-empty it is converted by _gemini_style_prefix into an
-    # English director's-note prefix for the upstream text: the model
-    # READS ALOUD a non-English style (e.g. a Burmese tone word) as if
-    # it were content, while an English instruction sentence is treated
-    # as a direction and not spoken.
+    # Optional tone/style instruction (e.g. "angry", "ဒေါသ").
+    # When non-empty it is converted by _gemini_style_tag into a
+    # bracketed audio tag ("[angry] ") placed at the very start of the
+    # text: live-verified 2026-11-05, the model treats a bracketed tag
+    # as markup — never spoken — while still changing the delivery,
+    # whereas any "Say in ... tone:" instruction prefix (English or
+    # Burmese) gets READ ALOUD as if it were content.
     # Also typed as Any and validated manually (400, not 422).
     style: Any = None
 
@@ -837,59 +838,129 @@ def _gemini_dialogue_parts(text: str, speaker_names: list) -> list:
     return parts
 
 
-# Burmese tone words the app offers as one-tap style chips, mapped to
-# English tone phrases. Live-verified behaviour: a style written in
-# Burmese is READ ALOUD by the model as content (the listener hears the
-# style word itself), while an English instruction sentence is treated
-# as a director's note and not spoken — so Burmese styles must be
-# translated before they reach the upstream prompt.
-_GEMINI_STYLE_MAP = [
-    ("ဒေါသ", "an angry"),
-    ("ပျော်", "a cheerful and friendly"),
-    ("ရွှင်လန်း", "a cheerful and friendly"),
-    ("တည်ငြိမ်", "a calm and relaxed"),
-    ("နွေးထွေး", "a warm and enthusiastic"),
-    ("ဝမ်းနည်း", "a sad and heartfelt"),
-    ("တိုးတိုး", "a whispered"),
-    ("စိတ်လှုပ်ရှား", "an excited, high-energy"),
-    ("ပုံပြင်", "a warm storytelling"),
-    ("သတင်း", "a clear newsreader"),
-    ("နှေး", "a slow"),
-    ("မြန်", "a rapid"),
-    ("မောပန်း", "an out-of-breath"),
-    ("ပျင်းရိ", "a bored, monotone"),
-    ("ကြင်နာ", "a gentle and kind"),
-    ("ကြောက်", "a fearful"),
-    ("အံ့ဩ", "a surprised"),
-    ("ယုံကြည်", "a confident"),
-    ("လေးနက်", "a serious"),
-    ("ဟာသ", "a humorous"),
-    ("ရှက်", "a shy"),
+# Burmese tone words the apps offer as one-tap style chips, mapped to
+# concise bracket-tag words. Live-verified 2026-11-05: the model READS
+# ALOUD any "Say in ... tone: " director's-note prefix — English or
+# Burmese — as if it were content (a styled sample came back longer,
+# with the prefix spoken as extra bursts), while a bracketed tag like
+# "[angry]" placed before the text is treated as markup, never spoken,
+# and still changes the delivery. So every style becomes a tag.
+_GEMINI_STYLE_TAGS = [
+    ("ဒေါသ", "angry"),
+    ("ပျော်", "cheerful"),
+    ("ရွှင်လန်း", "cheerful"),
+    ("တည်ငြိမ်", "calm"),
+    ("နွေးထွေး", "warm"),
+    ("ဝမ်းနည်း", "sad"),
+    ("တိုးတိုး", "whispering"),
+    ("စိတ်လှုပ်ရှား", "excited"),
+    ("ပုံပြင်", "storytelling"),
+    ("သတင်း", "newsreader"),
+    ("နှေး", "slow"),
+    ("မြန်", "fast"),
+    ("မောပန်း", "out of breath"),
+    ("ပျင်းရိ", "bored"),
+    ("ကြင်နာ", "gentle"),
+    ("ကြောက်", "fearful"),
+    ("အံ့ဩ", "surprised"),
+    ("ယုံကြည်", "confident"),
+    ("လေးနက်", "serious"),
+    ("ဟာသ", "humorous"),
+    ("ရှက်", "shy"),
 ]
 # Longest keys first, so a short key that happens to be a substring of
 # a longer one can never win the match.
-_GEMINI_STYLE_MAP.sort(key=lambda kv: -len(kv[0]))
+_GEMINI_STYLE_TAGS.sort(key=lambda kv: -len(kv[0]))
+
+# Known English tone phrases — the values the apps' preset chips send
+# (the private app's TONE_PRESETS and the public app's
+# GEM_STYLE_PRESETS), keyed by their normalized form (see
+# _gemini_style_tag) — mapped to concise tag words.
+_GEMINI_EN_TAG_MAP = {
+    "angry": "angry",
+    "cheerful": "cheerful",
+    "cheerful and friendly": "cheerful",
+    "calm": "calm",
+    "calm and relaxed": "calm",
+    "warm": "warm",
+    "warm and enthusiastic": "warm",
+    "sad": "sad",
+    "sad and heartfelt": "sad",
+    "whispered": "whispering",
+    "whispered urgently": "whispering",
+    "whispering": "whispering",
+    "excited": "excited",
+    "excited, high-energy": "excited",
+    "excited, high energy": "excited",
+    "excited high-energy": "excited",
+    "excited high energy": "excited",
+    "storytelling": "storytelling",
+    "warm storytelling": "storytelling",
+    "newsreader": "newsreader",
+    "clear newsreader": "newsreader",
+    "clear newsreader delivery": "newsreader",
+    "slow": "slow",
+    "speaking slowly": "slow",
+    "rapid": "fast",
+    "fast": "fast",
+    "speaking rapidly": "fast",
+    "out of breath": "out of breath",
+    "bored": "bored",
+    "bored, monotone": "bored",
+    "bored and monotone": "bored",
+    "gentle": "gentle",
+    "gentle and kind": "gentle",
+    "fearful": "fearful",
+    "surprised": "surprised",
+    "confident": "confident",
+    "serious": "serious",
+    "humorous": "humorous",
+    "shy": "shy",
+}
+
+# Any character in the Myanmar Unicode block.
+_MY_CHARS_RE = re.compile(r"[\u1000-\u109f]")
 
 
-def _gemini_style_prefix(style: str) -> str:
-    """Compose the English director's-note prefix for a client style.
+def _gemini_style_tag(style: str) -> str:
+    """Convert a client style into a bracketed audio tag, e.g. "[angry] ".
 
-    Returns "" for an empty style. A style containing a known Burmese
-    tone word becomes "Say in <english phrase> tone: "; a style that
-    already reads as an English instruction ("Say ...") is used as-is;
-    anything else (an English phrase, or a non-Latin style with no map
-    entry) is wrapped as "Say in this style (<style>): " so the model
-    still treats it as a direction rather than spoken content.
+    Returns "" for an empty style. Resolution order:
+    1. A known Burmese tone word (contains-match, longest key first)
+       maps to its concise English tag word.
+    2. An English style is normalized — lowercase, collapse
+       whitespace, drop a leading "say in ", drop a trailing
+       " tone of voice" / " tone" / " voice", drop a leading article —
+       then mapped to a concise tag when the phrase is known; any
+       other cleaned English phrase becomes the tag content itself
+       ("very happy" -> "[very happy] ").
+    3. Anything else (unmapped Burmese, or mixed text) is bracketed
+       as-is: bracketed text sits in markup position and is not read
+       aloud, strictly better than a bare instruction string, which
+       the model speaks.
     """
     s = (style or "").strip()
     if not s:
         return ""
-    for key, phrase in _GEMINI_STYLE_MAP:
+    for key, tag in _GEMINI_STYLE_TAGS:
         if key in s:
-            return f"Say in {phrase} tone: "
-    if s.lower().startswith("say"):
-        return f"{s}: "
-    return f"Say in this style ({s}): "
+            return f"[{tag}] "
+    if not _MY_CHARS_RE.search(s):
+        e = re.sub(r"\s+", " ", s.lower()).strip(" :.")
+        if e.startswith("say in "):
+            e = e[len("say in "):]
+        for suffix in (" tone of voice", " tone", " voice"):
+            if e.endswith(suffix):
+                e = e[: -len(suffix)]
+                break
+        for article in ("a ", "an ", "the "):
+            if e.startswith(article):
+                e = e[len(article):]
+                break
+        e = e.strip(" :.")
+        if e:
+            return f"[{_GEMINI_EN_TAG_MAP.get(e, e)}] "
+    return f"[{s}] "
 
 
 def _pcm_to_wav(pcm: bytes, sample_rate: int, channels: int = 1,
@@ -1080,9 +1151,9 @@ async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
             )
         style = req.style.strip()
 
-    # English director's-note form of the style ("" when no style):
-    # a raw Burmese style would be read aloud by the model as content.
-    style_prefix = _gemini_style_prefix(style)
+    # Bracketed-tag form of the style ("" when no style): any spoken
+    # instruction form would be read aloud by the model as content.
+    style_tag = _gemini_style_tag(style)
 
     text = req.text.strip()
 
@@ -1107,20 +1178,20 @@ async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
                        "line, prefixed with '<speaker>:' "
                        "(e.g. 'A: ...' and 'B: ...')",
             )
-        if style_prefix:
-            # Prefix the direction onto the FIRST segment's text so the
-            # direction itself is spoken by a speaker: a separate
+        if style_tag:
+            # Put the tag at the start of the FIRST segment's text so
+            # it rides on a part that names its speaker: a separate
             # leading part without speech_metadata would break the
             # multi-speaker rule that every part names its speaker.
-            parts[0]["text"] = style_prefix + parts[0]["text"]
+            parts[0]["text"] = style_tag + parts[0]["text"]
     else:
         speech_config = {
             "voiceConfig": {
                 "prebuiltVoiceConfig": {"voiceName": req.voice},
             },
         }
-        if style_prefix:
-            text = style_prefix + text
+        if style_tag:
+            text = style_tag + text
         parts = [{"text": text}]
 
     payload = {
