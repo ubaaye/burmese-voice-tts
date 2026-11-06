@@ -2702,3 +2702,49 @@ async def pub_vox_tts(
         content=resp.content,
         media_type=resp.headers.get("content-type") or "audio/wav",
     )
+
+
+@app.post("/api/vox/tts")
+async def vox_tts(
+    request: Request,
+    text: str = Form(...),
+    ref_text: str = Form(""),
+    ref_audio: UploadFile = File(...),
+):
+    """Private owner-key twin of /api/pub/vox/tts: forwards the
+    multipart form to the Kaggle backend's POST /tts and streams its
+    WAV back, gated ONLY by the owner key (no Supabase identity, no
+    master switch — the owner is always allowed). It exists so the
+    owner's own tooling can generate through this server when the
+    caller's network cannot reach the tunnel URL directly."""
+    _require_owner(request)
+    features = await _get_features()
+    base = features["vox_url"]
+    if not base:
+        raise HTTPException(status_code=503, detail=_VOX_NO_SESSION_MSG)
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Text is required")
+    audio_bytes = await _read_upload_capped(ref_audio)
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=400, detail="Reference audio file is empty")
+    files = {
+        "ref_audio": (
+            ref_audio.filename or "ref.wav",
+            audio_bytes,
+            ref_audio.content_type or "audio/wav",
+        ),
+    }
+    data = {"text": text.strip(), "ref_text": ref_text or ""}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0), trust_env=False) as client:
+            resp = await client.post(
+                base.rstrip("/") + "/tts", data=data, files=files)
+    except Exception:
+        raise HTTPException(status_code=502, detail=_VOX_UPSTREAM_MSG)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=_VOX_UPSTREAM_MSG)
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type") or "audio/wav",
+    )
