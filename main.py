@@ -1309,6 +1309,127 @@ async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
     return Response(content=_pcm_to_wav(pcm, sample_rate), media_type="audio/wav")
 
 
+# --- Gemini translate (text -> Burmese, key stays server-side) ---
+# Added for the Telegram bot's full-conversion path: the bot cannot
+# call Gemini directly from its sandbox (its credential plumbing can
+# only present the key as a Bearer token, which Google rejects), so
+# translation runs here on the server's GEMINI_API_KEY, behind the
+# same owner gate as /api/gemini/tts. One chunk per call; the caller
+# owns pacing/retries and needs TRUE provider statuses back (a Gemini
+# 429 must surface as a 429, never masked as a 200).
+
+# Model chain for text generation: tried in order ONLY on 404 /
+# model-not-found errors; any other failure (429, 5xx) surfaces as-is.
+GEMINI_TRANSLATE_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+)
+
+# The translation contract — kept identical to the bot's
+# _TRANSLATE_SYSTEM (~/workspace/telegram-bot/bot.py) so the output
+# style does not change when the engine moves server-side.
+_TRANSLATE_SYSTEM = (
+    "You are a professional translator. Translate the user's text into "
+    "natural, spoken-style Burmese (Myanmar language) suitable for "
+    "audiobook narration. Be faithful to the meaning — do not add, "
+    "remove, or summarize anything. Use spoken Burmese forms rather "
+    "than stiff written forms. Write numbers as Burmese words where "
+    "natural. Output ONLY the translation, with no commentary, notes, "
+    "or quotation marks around it.")
+
+
+class GeminiTranslateRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/gemini/translate")
+async def gemini_translate(req: GeminiTranslateRequest, request: Request):
+    """Translate one text chunk into spoken-style Burmese via Gemini,
+    using the server-side key."""
+    _require_owner(request)
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini is not configured on the server (GEMINI_API_KEY missing)",
+        )
+    return await _gemini_translate_core(req.text, GEMINI_API_KEY)
+
+
+async def _gemini_translate_core(text: str, api_key: str):
+    """Gemini text generation using the given key (server key only —
+    there is no public translate route). Returns {"text": <burmese>}."""
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Text is required")
+    if len(text) > MAX_TEXT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Text is too long: maximum {MAX_TEXT_CHARS} characters per request",
+        )
+
+    payload = {
+        "systemInstruction": {"parts": [{"text": _TRANSLATE_SYSTEM}]},
+        "contents": [{"parts": [{"text": text.strip()}]}],
+        # Low temperature: faithful translation, not creative rewrite.
+        "generationConfig": {"temperature": 0.2},
+    }
+
+    last_error = None
+    resp = None
+    for model in GEMINI_TRANSLATE_MODELS:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+                resp = await client.post(
+                    f"{GEMINI_BASE}/v1beta/models/{model}:generateContent",
+                    json=payload,
+                    headers={
+                        "x-goog-api-key": api_key,
+                        "Content-Type": "application/json",
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Gemini service error: {e}")
+
+        if resp.status_code == 200:
+            break
+
+        detail = _gemini_error_detail(resp)
+        last_error = HTTPException(
+            status_code=resp.status_code,
+            detail=f"Gemini error ({resp.status_code}): {detail}",
+        )
+        # Fall through to the next model ONLY when this one is not
+        # available on the key; rate limits and server errors must
+        # reach the caller with their true status code.
+        if resp.status_code == 404 or "not found" in detail.lower():
+            continue
+        raise last_error
+    else:
+        raise last_error
+
+    try:
+        data = resp.json()
+        parts = data["candidates"][0]["content"]["parts"]
+        if not isinstance(parts, list):
+            parts = []
+    except Exception:
+        parts = []
+
+    out = "".join(
+        str(part.get("text") or "")
+        for part in parts
+        if isinstance(part, dict)
+    ).strip()
+    if not out:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini returned no text: {resp.text[:200]}",
+        )
+    return {"text": out}
+
+
 # --- Public edition routes (/api/pub/*) ---
 # Every route here requires a valid Supabase access token. For the
 # paid/quota engines the provider key is resolved per request by
