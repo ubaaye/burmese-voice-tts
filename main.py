@@ -1371,7 +1371,13 @@ async def _gemini_translate_core(text: str, api_key: str):
         "systemInstruction": {"parts": [{"text": _TRANSLATE_SYSTEM}]},
         "contents": [{"parts": [{"text": text.strip()}]}],
         # Low temperature: faithful translation, not creative rewrite.
-        "generationConfig": {"temperature": 0.2},
+        # Thinking level LOW: at the default level gemini-3.8-flash spent
+        # 262s "thinking" about a one-sentence translation (measured live
+        # 2026-11-09); translation needs speed + fidelity, not deep thought.
+        "generationConfig": {
+            "temperature": 0.2,
+            "thinkingConfig": {"thinkingLevel": "low"},
+        },
     }
 
     last_error = None
