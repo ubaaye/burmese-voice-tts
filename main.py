@@ -1321,9 +1321,9 @@ async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
 # Model chain for text generation: tried in order ONLY on 404 /
 # model-not-found errors; any other failure (429, 5xx) surfaces as-is.
 GEMINI_TRANSLATE_MODELS = (
+    "gemini-3.8-flash",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
 )
 
 # The translation contract — kept identical to the bot's
