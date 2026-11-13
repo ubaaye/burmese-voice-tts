@@ -1023,28 +1023,107 @@ def _pcm_to_wav(pcm: bytes, sample_rate: int, channels: int = 1,
     return header + pcm
 
 
+def _hiss_burst_cut(samples, sample_rate):
+    """Sample index to cut at to remove a trailing Gemini hiss burst,
+    or None when no clear burst is present. Detection (proven on live
+    captures, 2026-11-13): 50 ms windows find the final active run; it
+    is a burst when it is short (<=0.75 s) and all noise-like (mean
+    ZCR >= 0.08, min ZCR > 0.05, >=60% of windows ZCR > 0.06) and a
+    >=80 ms silence gap separates it from the speech — the gap is
+    measured at 10 ms resolution from the end of the last window at
+    or above -45 dB, with >=75% of the gap below -50 dB. The cut
+    keeps a 40 ms silence pad after the real speech end."""
+    def win_stats(seg):
+        rms = math.sqrt(sum(x * x for x in seg) / len(seg))
+        db = 20 * math.log10(rms / 32768.0) if rms > 0 else -99.0
+        zcr = (sum(1 for j in range(1, len(seg))
+                   if (seg[j - 1] < 0) != (seg[j] < 0)) / len(seg))
+        return db, zcr
+
+    def windows(win_ms):
+        win = max(1, int(sample_rate * win_ms / 1000))
+        out = []
+        for i in range(0, len(samples), win):
+            seg = samples[i:i + win]
+            if len(seg) < win // 4:
+                break
+            db, zcr = win_stats(seg)
+            out.append((i, len(seg), db, zcr))
+        return out
+
+    ws = windows(50)
+    active = [k for k, (i, n, db, zc) in enumerate(ws) if db > -45.0]
+    if not active:
+        return None
+    last = active[-1]
+    t = last
+    while t - 1 >= 0 and ws[t - 1][2] > -45.0:
+        t -= 1
+    if t == 0:
+        return None
+    tail = ws[t:last + 1]
+    tail_s = sum(n for i, n, db, zc in tail) / sample_rate
+    if tail_s > 0.75:
+        return None
+    mean_zcr = (sum(zc * n for i, n, db, zc in tail)
+                / sum(n for i, n, db, zc in tail))
+    min_zcr = min(zc for i, n, db, zc in tail)
+    frac = sum(1 for i, n, db, zc in tail if zc > 0.06) / len(tail)
+    if mean_zcr < 0.08 or min_zcr <= 0.05 or frac < 0.6:
+        return None
+    tail_start = ws[t][0] / sample_rate
+    subs = windows(10)
+    before = [s for s in subs
+              if (s[0] + s[1]) / sample_rate <= tail_start + 1e-9]
+    loud = [s for s in before if s[2] >= -45.0]
+    if not loud:
+        return None
+    speech_end = (loud[-1][0] + loud[-1][1]) / sample_rate
+    gap_subs = [s for s in before if s[0] / sample_rate >= speech_end - 1e-9]
+    gap_ms = (tail_start - speech_end) * 1000
+    deep = (sum(1 for s in gap_subs if s[2] < -50.0)
+            / len(gap_subs)) if gap_subs else 0.0
+    if gap_ms < 80 or deep < 0.75:
+        return None
+    return int((speech_end + 0.040) * sample_rate)
+
+
 def _clean_gemini_pcm(pcm: bytes, sample_rate: int) -> bytes:
     """Trim edge junk from Gemini's raw PCM (16-bit little-endian mono).
 
     Live captures show two artifacts: impulse spikes within the first
     ~10 ms (then silence before the speech starts), and a short loud
-    DC-heavy segment that appears AFTER a >=200 ms silence gap
-    following the last speech — a detached trailing "blip" that sounds
-    like a click/thud at the very end. This trims leading spikes and
-    silence up to the first sustained speech, cuts everything after
-    the real speech end (+40 ms pad), and applies a 10 ms linear
-    fade-in / 15 ms linear fade-out at the cut points so the cuts
-    themselves never click.
+    segment that appears AFTER a silence gap following the last
+    speech — a detached trailing artifact. Two spectra are confirmed:
+    a DC-heavy "blip" (click/thud) and, since 2026-11-13, a
+    high-frequency HISS burst (~0.2 s, RMS louder than the speech,
+    ~62% of energy at 6-12 kHz, high zero-crossing rate) that users
+    hear as a "shhh" at the end of every generated file. This trims
+    leading spikes and silence up to the first sustained speech, cuts
+    everything after the real speech end (+40 ms pad), and applies a
+    10 ms linear fade-in / 15 ms linear fade-out at the cut points so
+    the cuts themselves never click.
 
-    Analysis uses 10 ms windows (per-window RMS and mean). The tail
-    walk skips windows that are quiet (rms <= 0.02) or DC-heavy
-    (|mean| > 0.04 and |mean| >= 0.3 * rms). One refinement over a
-    plain backward walk: a loud run detached from the speech by a
-    >=150 ms quiet gap whose windows lean DC ON AVERAGE is treated as
+    Analysis uses 10 ms windows (per-window RMS, mean and zero-crossing
+    rate). The tail walk skips windows that are quiet (rms <= 0.02) or
+    DC-heavy (|mean| > 0.04 and |mean| >= 0.3 * rms). One refinement
+    over a plain backward walk: a loud run detached from the speech by
+    a >=150 ms quiet gap whose windows lean DC ON AVERAGE is treated as
     one artifact blip and skipped whole — in the captured fixture the
     blip's individual windows straddle the 0.3 DC ratio, so a purely
     per-window walk stops inside the junk. A detached run that does
     NOT lean DC is kept (it could be a real final word after a pause).
+
+    The HISS burst is removed by a pre-pass (_hiss_burst_cut) before
+    the walk: at 10 ms resolution the burst fragments (DC-heavy
+    windows, ~30 ms zero holes), but at 50 ms resolution it is one
+    loud run after a clear silence gap. The pre-pass cuts at the gap
+    (+40 ms pad) when the gap is >=80 ms (measured at 10 ms
+    resolution, >=75% of it below -50 dB) and the final run is short
+    (<=0.75 s) and all noise-like — mean ZCR >= 0.08, min ZCR > 0.05,
+    >=60% of its 50 ms windows with ZCR > 0.06. Voiced speech always
+    contains low-ZCR vowel windows, so a run with none is hiss, not a
+    word; anything less clear is left unchanged for the walk.
 
     Safety: if no sustained speech is found, or the trim would remove
     more than 40% of the total duration, the original PCM is returned
@@ -1057,6 +1136,19 @@ def _clean_gemini_pcm(pcm: bytes, sample_rate: int) -> bytes:
     samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
     if sys.byteorder == "big":
         samples.byteswap()
+    # Hiss-burst pre-pass (2026-11-13): truncate a trailing hiss burst
+    # before the edge walk below analyses the audio. `pcm` is updated
+    # too, so the walk's "return pcm unchanged" exits below return the
+    # truncated audio, not the bursted original.
+    cut = _hiss_burst_cut(samples, sample_rate)
+    if cut is not None and 0 < cut < len(samples):
+        samples = samples[:cut]
+        if sys.byteorder == "big":
+            swapped = samples[:]
+            swapped.byteswap()
+            pcm = swapped.tobytes()
+        else:
+            pcm = samples.tobytes()
     n = len(samples)
     win = max(1, sample_rate // 100)  # 10 ms
     nwin = n // win
