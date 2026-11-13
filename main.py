@@ -62,6 +62,29 @@ EL_DEFAULT_MODEL_ID = "eleven_v4"
 # Gemini TTS proxy: the API key lives ONLY in this server's environment.
 # It is never sent to the web app or included in any response/log.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+
+def _parse_gemini_key_pool():
+    """All server-side Gemini keys: GEMINI_API_KEYS (comma / newline /
+    semicolon separated — the owner's AI Studio keys) plus the legacy
+    single GEMINI_API_KEY, de-duplicated, order preserved. Server-key
+    Gemini calls rotate through this pool on quota (429) errors, so
+    one spent key no longer blocks the owner / Pro-code paths."""
+    pool = []
+    for raw in (os.environ.get("GEMINI_API_KEYS", ""), GEMINI_API_KEY):
+        for part in re.split(r"[,\n;]+", raw or ""):
+            k = part.strip()
+            if k and k not in pool:
+                pool.append(k)
+    return pool
+
+
+GEMINI_KEY_POOL = _parse_gemini_key_pool()
+if not GEMINI_API_KEY and GEMINI_KEY_POOL:
+    # Keep every single-key consumer (health, _resolve_pub_key,
+    # status) working when only the pool variable is configured.
+    GEMINI_API_KEY = GEMINI_KEY_POOL[0]
+
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 GEMINI_DEFAULT_VOICE = "Kore"
@@ -1245,21 +1268,22 @@ def _clean_gemini_pcm(pcm: bytes, sample_rate: int) -> bytes:
 async def gemini_status(request: Request):
     """Report whether Gemini TTS is configured, and which model is in use."""
     _require_owner(request)
-    if not GEMINI_API_KEY:
+    if not GEMINI_KEY_POOL:
         return {"configured": False}
-    return {"configured": True, "model": GEMINI_TTS_MODEL}
+    return {"configured": True, "model": GEMINI_TTS_MODEL,
+            "keys": len(GEMINI_KEY_POOL)}
 
 
 @app.post("/api/gemini/tts")
 async def gemini_tts(req: GeminiTTSRequest, request: Request):
-    """Generate speech via Gemini TTS using the server-side key."""
+    """Generate speech via Gemini TTS using the server-side key pool."""
     _require_owner(request)
-    if not GEMINI_API_KEY:
+    if not GEMINI_KEY_POOL:
         raise HTTPException(
             status_code=503,
             detail="Gemini is not configured on the server (GEMINI_API_KEY missing)",
         )
-    return await _gemini_tts_core(req, GEMINI_API_KEY)
+    return await _gemini_tts_server(req)
 
 
 async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
@@ -1401,6 +1425,29 @@ async def _gemini_tts_core(req: GeminiTTSRequest, api_key: str):
     return Response(content=_pcm_to_wav(pcm, sample_rate), media_type="audio/wav")
 
 
+async def _gemini_tts_server(req: GeminiTTSRequest):
+    """Gemini TTS on the SERVER's key pool (private owner route and
+    the public owner / Pro-code paths): try each configured key in
+    order, moving to the next ONLY when Gemini reports quota
+    exhaustion (429). Any other error surfaces immediately with its
+    true status — a bad request must not burn the remaining keys."""
+    if not GEMINI_KEY_POOL:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini is not configured on the server (GEMINI_API_KEY missing)",
+        )
+    last_exc = None
+    for key in GEMINI_KEY_POOL:
+        try:
+            return await _gemini_tts_core(req, key)
+        except HTTPException as e:
+            if e.status_code == 429:
+                last_exc = e
+                continue
+            raise
+    raise last_exc
+
+
 # --- Gemini translate (text -> Burmese, key stays server-side) ---
 # Added for the Telegram bot's full-conversion path: the bot cannot
 # call Gemini directly from its sandbox (its credential plumbing can
@@ -1440,12 +1487,28 @@ async def gemini_translate(req: GeminiTranslateRequest, request: Request):
     """Translate one text chunk into spoken-style Burmese via Gemini,
     using the server-side key."""
     _require_owner(request)
-    if not GEMINI_API_KEY:
+    if not GEMINI_KEY_POOL:
         raise HTTPException(
             status_code=503,
             detail="Gemini is not configured on the server (GEMINI_API_KEY missing)",
         )
-    return await _gemini_translate_core(req.text, GEMINI_API_KEY)
+    return await _gemini_translate_server(req.text)
+
+
+async def _gemini_translate_server(text: str):
+    """Translate on the SERVER's key pool: same rotation rule as TTS —
+    the next key is tried only on a 429; every other status (the bot
+    depends on true provider statuses) surfaces unchanged."""
+    last_exc = None
+    for key in GEMINI_KEY_POOL:
+        try:
+            return await _gemini_translate_core(text, key)
+        except HTTPException as e:
+            if e.status_code == 429:
+                last_exc = e
+                continue
+            raise
+    raise last_exc
 
 
 async def _gemini_translate_core(text: str, api_key: str):
@@ -1982,7 +2045,13 @@ async def pub_gemini_tts(req: GeminiTTSRequest, request: Request):
     await _check_mode_enabled(user_id, "gemini")
     api_key, code, needs_bind, server_key = await _resolve_pub_key(
         request, user_id, user_email, "X-Gemini-Key", "GEMINI_API_KEY")
-    resp = await _gemini_tts_core(req, api_key)
+    if server_key:
+        # Owner / Pro-code callers run on the server's key POOL
+        # (rotates past a quota-spent key); a visitor's own key is
+        # used exactly as given, with no rotation.
+        resp = await _gemini_tts_server(req)
+    else:
+        resp = await _gemini_tts_core(req, api_key)
     await _pro_code_touch(code, user_id, needs_bind)
     return resp
 
